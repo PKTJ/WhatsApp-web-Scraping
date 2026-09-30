@@ -16,8 +16,17 @@ const stopButton = document.getElementById("stopButton");
 const stopDialog = document.getElementById("stopDialog");
 const stopConfirm = document.getElementById("stopConfirm");
 const stopCancel = document.getElementById("stopCancel");
+const contactFileInput = document.getElementById("contactFile");
+const invertCheckButton = document.getElementById("invertCheckButton");
+const contactFileStatus = document.getElementById("contactFileStatus");
+const contactMatchModeInput = document.getElementById("contactMatchMode");
+const contactMatchDetails = document.getElementById("contactMatchDetails");
+const contactMatchResults = document.getElementById("contactMatchResults");
 
 let chats = [];
+let importedContacts = [];
+let importedFileName = "";
+let importedMatchMode = "smart";
 let busy = false;
 const selectedChatIds = new Set();
 const liveResults = new Map();
@@ -32,6 +41,9 @@ let saveTimer = null;
 function collectSessionState() {
   return {
     chats,
+    imported_contacts: importedContacts,
+    imported_file_name: importedFileName,
+    imported_match_mode: importedMatchMode,
     selected_chat_ids: [...selectedChatIds],
     live_results: [...liveResults.values()],
     search_query: chatSearchInput.value,
@@ -41,7 +53,8 @@ function collectSessionState() {
       max_messages: maxMessagesInput.value,
       load_wait_seconds: loadWaitSecondsInput.value,
       export_images: exportImagesInput.checked,
-      image_wait_seconds: imageWaitSecondsInput.value
+      image_wait_seconds: imageWaitSecondsInput.value,
+      contact_match_mode: contactMatchModeInput.value
     }
   };
 }
@@ -69,11 +82,15 @@ async function restoreState() {
     if (settings.max_messages) maxMessagesInput.value = settings.max_messages;
     if (settings.load_wait_seconds) loadWaitSecondsInput.value = settings.load_wait_seconds;
     if (settings.image_wait_seconds) imageWaitSecondsInput.value = settings.image_wait_seconds;
+    contactMatchModeInput.value = settings.contact_match_mode === "exact" ? "exact" : "smart";
     if (typeof settings.export_images === "boolean") {
       exportImagesInput.checked = settings.export_images;
     }
 
     if (Array.isArray(state.chats)) chats = state.chats;
+    if (Array.isArray(state.imported_contacts)) importedContacts = state.imported_contacts;
+    if (typeof state.imported_file_name === "string") importedFileName = state.imported_file_name;
+    importedMatchMode = state.imported_match_mode === "exact" ? "exact" : "smart";
     if (Array.isArray(state.selected_chat_ids)) {
       selectedChatIds.clear();
       for (const id of state.selected_chat_ids) selectedChatIds.add(id);
@@ -91,6 +108,10 @@ async function restoreState() {
 
     renderChats();
     renderResults();
+    if (importedContacts.length) {
+      // Pulihkan penjelasan, tetapi jangan menimpa ceklis manual yang tersimpan.
+      renderContactMatches(ContactList.matchContacts(chats, importedContacts, { mode: importedMatchMode }));
+    }
 
     if (state.status_text) {
       setStatus(state.status_text, Boolean(state.status_error));
@@ -173,15 +194,102 @@ function updateSelectionUi() {
       : "Pilih semua";
 
   selectAllButton.disabled = busy || visible.length === 0;
+  invertCheckButton.disabled = busy || chats.length === 0;
   exportButton.disabled = busy || selectedCount === 0;
   chatSearchInput.disabled = busy || chats.length === 0;
   clearSearchButton.hidden = chatSearchInput.value.length === 0;
+  for (const checkbox of contactMatchResults.querySelectorAll('input[type="checkbox"]')) {
+    checkbox.checked = selectedChatIds.has(checkbox.value);
+    checkbox.disabled = busy;
+  }
   persistState();
+}
+
+function renderContactMatches(report) {
+  contactMatchResults.replaceChildren();
+  contactMatchDetails.hidden = importedContacts.length === 0 || chats.length === 0;
+  if (!importedContacts.length) return;
+  if (!chats.length) {
+    contactFileStatus.textContent = `${importedContacts.length} baris kontak dimuat. Klik Pindai untuk mencocokkan daftar.`;
+    return;
+  }
+  const source = importedFileName ? ` pada “${importedFileName}”` : " dari daftar tersimpan";
+  const similarCount = report.matches.filter((match) => ["normalized", "keyword", "fuzzy"].includes(match.kind)).length;
+  contactFileStatus.textContent = `${report.matchedCount} dari ${importedContacts.length} baris kontak${source} cocok otomatis dengan ${report.chatIds.length} chat` +
+    ` · ${similarCount} melalui nama mirip/normalisasi · ${report.ambiguousCount} perlu diperiksa · ${report.unmatchedCount} tidak ditemukan. Pilihan manual tidak mengubah hitungan kecocokan otomatis.`;
+
+  const labels = {
+    id: "ID angka sama", exact: "Nama persis", normalized: "Nama setelah normalisasi",
+    keyword: "Kata kunci utuh", fuzzy: "Nama mirip", ambiguous: "Perlu diperiksa — beberapa kandidat",
+    unmatched: "Tidak ditemukan"
+  };
+  for (const match of report.matches) {
+    const entry = importedContacts[match.entryIndex];
+    const row = document.createElement("div");
+    row.className = `contact-match-item ${match.kind}`;
+    const title = document.createElement("strong");
+    title.textContent = `${entry.name || entry.id}${entry.community ? ` (${entry.community})` : ""} — ${labels[match.kind]}`;
+    row.appendChild(title);
+    for (const candidate of match.candidates) {
+      const label = document.createElement("label");
+      label.className = "contact-match-candidate";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = candidate.chatId;
+      checkbox.checked = selectedChatIds.has(candidate.chatId);
+      checkbox.disabled = busy;
+      checkbox.addEventListener("change", () => {
+        if (busy) return;
+        if (checkbox.checked) selectedChatIds.add(candidate.chatId);
+        else selectedChatIds.delete(candidate.chatId);
+        renderChats();
+      });
+      const name = document.createElement("span");
+      const score = candidate.kind === "fuzzy" ? ` (${Math.round(candidate.score * 100)}%)` : "";
+      name.textContent = `${candidate.name}${candidate.community ? ` (${candidate.community})` : ""} — ${labels[candidate.kind]}${score}`;
+      label.append(checkbox, name);
+      row.appendChild(label);
+    }
+    contactMatchResults.appendChild(row);
+  }
+}
+
+function applyImportedContacts() {
+  importedMatchMode = contactMatchModeInput.value;
+  const report = ContactList.matchContacts(chats, importedContacts, { mode: importedMatchMode });
+  for (const id of report.chatIds) selectedChatIds.add(id);
+  renderContactMatches(report);
+  return report;
+}
+
+async function importContactList(file) {
+  if (!file) return;
+  try {
+    if (busy) throw new Error("Tunggu proses scan/ekspor selesai sebelum memuat daftar.");
+    if (file.size > 20_000_000) throw new Error("File terlalu besar (maksimum 20 MB).");
+    const entries = await ContactList.readContactsFile(file);
+    if (busy) throw new Error("Proses scan/ekspor sedang berjalan. Unggah ulang daftar setelah selesai.");
+    importedContacts = entries;
+    importedFileName = file.name;
+    const report = applyImportedContacts();
+    renderChats();
+    setStatus(chats.length
+      ? `Daftar dimuat: ${report.chatIds.length} chat cocok otomatis dan diceklis. Pilihan sebelumnya tetap dipertahankan.${report.ambiguousCount ? " Buka Rincian pencocokan untuk memeriksa kandidat ambigu." : ""}`
+      : "Daftar dimuat. Klik Pindai untuk mencocokkan nama dengan chat WhatsApp.");
+  } catch (error) {
+    contactFileStatus.textContent = error.message;
+    setStatus(error.message, true);
+  } finally {
+    contactFileInput.value = "";
+  }
 }
 
 function setBusy(isBusy) {
   busy = isBusy;
   scanButton.disabled = isBusy;
+  contactFileInput.disabled = isBusy;
+  contactMatchModeInput.disabled = isBusy;
+  contactFileInput.parentElement.querySelector("label").classList.toggle("disabled", isBusy);
   maxMessagesInput.disabled = isBusy;
   loadWaitSecondsInput.disabled = isBusy;
   exportImagesInput.disabled = isBusy;
@@ -536,6 +644,7 @@ scanButton.addEventListener("click", async () => {
   selectedChatIds.clear();
   chats = [];
   chatSearchInput.value = "";
+  renderContactMatches(ContactList.matchContacts([], importedContacts));
   renderChats();
   setStatus(
     "Memindai daftar Chats (All & Groups). Cepat — tanpa membuka panel Communities…"
@@ -552,6 +661,7 @@ scanButton.addEventListener("click", async () => {
     }
 
     chats = response.chats || [];
+    applyImportedContacts();
     renderChats();
 
     const scanStats = response.scan_stats || {};
@@ -580,6 +690,7 @@ scanButton.addEventListener("click", async () => {
   } catch (error) {
     chats = [];
     selectedChatIds.clear();
+    renderContactMatches(ContactList.matchContacts([], importedContacts));
     renderChats();
     setStatus(error.message, true);
   } finally {
@@ -598,6 +709,18 @@ selectAllButton.addEventListener("click", () => {
 
   renderChats();
 });
+
+invertCheckButton.addEventListener("click", () => {
+  for (const chat of chats) {
+    if (selectedChatIds.has(chat.id)) selectedChatIds.delete(chat.id);
+    else selectedChatIds.add(chat.id);
+  }
+  renderChats();
+  setStatus("Ceklis dibalik: yang terpilih menjadi tidak terpilih dan sebaliknya.");
+});
+
+contactFileInput.addEventListener("change", () => importContactList(contactFileInput.files?.[0]));
+contactMatchModeInput.addEventListener("change", persistState);
 
 exportButton.addEventListener("click", async () => {
   const chatIds = getSelectedIds();
@@ -671,9 +794,12 @@ exportButton.addEventListener("click", async () => {
     const jsonText = Number(response.jsonFiles || 0)
       ? ` ${Number(response.jsonFiles)} file JSON terpisah di folder messages/.`
       : "";
+    const contactsText = response.contactsFile
+      ? " File exported-contacts.csv tersedia di akar ZIP untuk dipakai pada ekspor berikutnya."
+      : "";
 
     setStatus(
-      `${response.stoppedByUser ? "Dihentikan" : "Selesai"}: ${attemptedCount} chat dicoba, ${response.exportedChats} berhasil dibaca, dan ${response.exportedMessages} pesan diekspor.${imageText}${suffix}${folderText}${jsonText}`
+      `${response.stoppedByUser ? "Dihentikan" : "Selesai"}: ${attemptedCount} chat dicoba, ${response.exportedChats} berhasil dibaca, dan ${response.exportedMessages} pesan diekspor.${imageText}${suffix}${folderText}${jsonText}${contactsText}`
     );
   } catch (error) {
     setStatus(error.message, true);

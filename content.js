@@ -2175,12 +2175,18 @@
   function publicChatEntry(entry) {
     return {
       id: entry.id,
+      contact_id: extractNumericContactId(entry.identity_key),
       name: entry.name,
       preview: entry.preview || "",
       community_name: entry.community_name || null,
       source_kind: entry.source_kind || "chat",
       membership_status: entry.membership_status || null
     };
+  }
+
+  function extractNumericContactId(identityKey) {
+    const match = /(?:data-jid|data-chat-id|data-id):\+?(\d{6,20})(?:@(?:c\.us|s\.whatsapp\.net))?/i.exec(String(identityKey || ""));
+    return match ? match[1] : null;
   }
 
   function compareScannedEntries(a, b) {
@@ -2371,6 +2377,7 @@
         json_file_mode: "one_file_per_chat",
         json_file_naming: "messages/<nama chat>-<hash nama>.json",
         summary_file: "export-summary.json",
+        contacts_file: "exported-contacts.csv",
         media_directory: options.exportImages ? "img" : null
       },
       export_settings: {
@@ -2430,7 +2437,7 @@
         "Selector DOM WhatsApp Web dapat berubah dan mungkin memerlukan pembaruan ekstensi.",
         "Urutan pesan diprioritaskan berdasarkan posisi visual dari atas ke bawah pada DOM WhatsApp Web; timestamp digunakan sebagai fallback.",
         "Chat yang gagal ditemukan atau gagal dibuka tetap tercatat di export_summary.per_chat dengan status error dan tetap dihitung pada attempted_chat_count.",
-        "Setiap kontak/grup disimpan sebagai satu file JSON terpisah di folder messages/. Ringkasan seluruh chat, daftar error, dan indeks file berada di export-summary.json pada akar arsip."
+        "Setiap kontak/grup disimpan sebagai satu file JSON terpisah di folder messages/. Ringkasan seluruh chat, daftar error, indeks file, dan exported-contacts.csv berada di akar arsip."
       ].filter(Boolean),
       errors,
       // chats sengaja TIDAK disertakan di sini. Payload ini dipakai sebagai
@@ -2481,6 +2488,7 @@
       outputDirectory: exportRoot,
       // Jumlah file JSON per chat yang benar-benar masuk ke folder messages.
       jsonFiles: jsonFiles.length,
+      contactsFile: `${exportRoot}/exported-contacts.csv`,
       jsonFilePaths: jsonFiles.map((file) => file.relative_path),
       errors,
       chatResults
@@ -2504,6 +2512,7 @@
 
     return {
       chat_id: chat.chat_id || null,
+      contact_id: chat.contact_id || null,
       chat_name: chat.chat_name,
       source_kind: chat.source_kind || "chat",
       community_name: chat.community_name || null,
@@ -3505,7 +3514,8 @@
 
         scrollStepsUsed += 1;
         const countBefore = collector.size;
-        triggerOlderMessagesLoad(scroller, main);
+        const clickedOlder = clickOlderMessagesButton(main);
+        if (!clickedOlder) triggerOlderMessagesLoad(scroller, main);
 
         const waitResult = await waitForOlderMessageProgress({
           main,
@@ -3517,6 +3527,7 @@
         });
 
         totalWaitMs += waitResult.waitedMs;
+        if (waitResult.scroller?.isConnected) scroller = waitResult.scroller;
 
         if (waitResult.progress) {
           successfulLoadBatches += 1;
@@ -3627,6 +3638,7 @@
 
     return {
       chat_id: entry.id,
+      contact_id: extractNumericContactId(entry.identity_key),
       chat_name: entry.name,
       chat_type: inferChatType(main),
       source_kind: entry.source_kind || "chat",
@@ -3710,6 +3722,20 @@
     }
   }
 
+  function clickOlderMessagesButton(main) {
+    // Hanya tombol aksi pemuatan, bukan teks pesan yang kebetulan serupa.
+    for (const button of main?.querySelectorAll?.('button, [role="button"]') || []) {
+      if (!isVisible(button)) continue;
+      const labels = [button.getAttribute?.("aria-label"), button.getAttribute?.("title"), button.textContent]
+        .map((value) => String(value || "").trim().replace(/\s+/g, " "));
+      if (labels.some((value) => /^(?:muat|tampilkan|lihat|load|show|view) (?:lebih banyak )?(?:pesan|messages?) (?:lama|sebelumnya|older|previous|earlier)(?: lagi)?$/i.test(value))) {
+        button.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function waitForOlderMessageProgress({
     main,
     scroller,
@@ -3723,8 +3749,12 @@
     let previousHeight = activeScroller.scrollHeight;
     let previousTop = activeScroller.scrollTop;
     let lastDomMovementAt = startedAt;
+    let lastNudgeAt = startedAt;
+    let loadingSince = null;
+    let extraWaitMs = 0;
 
-    while (Date.now() - startedAt < maxWaitMs) {
+    while (Date.now() - startedAt < maxWaitMs + extraWaitMs) {
+      if (isStopRequested()) break;
       await sleep(280);
 
       if (!activeScroller.isConnected) {
@@ -3733,7 +3763,8 @@
           return {
             progress: false,
             waitedMs: Date.now() - startedAt,
-            scrollerLost: true
+            scrollerLost: true,
+            scroller: null
           };
         }
       }
@@ -3744,7 +3775,8 @@
         return {
           progress: true,
           waitedMs: Date.now() - startedAt,
-          scrollerLost: false
+          scrollerLost: false,
+          scroller: activeScroller
         };
       }
 
@@ -3763,13 +3795,20 @@
       // Jika WhatsApp masih menampilkan indikator pemuatan atau struktur scroll
       // masih berubah, tunggu sampai batas maksimum alih-alih menganggap gagal.
       const loading = isOlderMessagesLoading(main);
+      if (loading) {
+        if (loadingSince === null) loadingSince = Date.now();
+        // Beri waktu tambahan bila indikator pemuatan nyata terlihat, terbatas.
+        if (Date.now() - loadingSince >= 600) extraWaitMs = Math.min(20_000, maxWaitMs);
+      } else loadingSince = null;
       const stableForMs = Date.now() - lastDomMovementAt;
 
       // Saat tidak berada di dekat atas dan tidak ada perubahan sama sekali,
       // lakukan dorongan tambahan supaya virtual list terus bergerak ke atas.
-      if (!loading && stableForMs >= 1_500 && activeScroller.scrollTop > 80) {
-        triggerOlderMessagesLoad(activeScroller);
-        lastDomMovementAt = Date.now();
+      if (!loading && stableForMs >= 900 && Date.now() - lastNudgeAt >= 1_200) {
+        if (!clickOlderMessagesButton(main) && activeScroller.scrollTop > 0) {
+          triggerOlderMessagesLoad(activeScroller, main);
+        }
+        lastNudgeAt = Date.now();
       }
     }
 
@@ -3778,7 +3817,8 @@
     return {
       progress: getCollectedCount() > countBefore,
       waitedMs: Date.now() - startedAt,
-      scrollerLost: false
+      scrollerLost: false,
+      scroller: activeScroller
     };
   }
 
@@ -4543,6 +4583,14 @@
     files.push({
       path: `${exportRoot}/export-summary.json`,
       data: JSON.stringify(buildExportSummaryJson({ payload, jsonFiles }), null, 2)
+    });
+
+    // Daftar ini sengaja hanya memuat chat yang berhasil dibaca dan dimasukkan
+    // ke arsip. File tersebut dapat diunggah ke ekspor berikutnya untuk mengunci
+    // ulang pilihan berdasarkan nama persis atau ID angka.
+    files.push({
+      path: `${exportRoot}/exported-contacts.csv`,
+      data: ContactList.buildExportedContactsCsv(exportedChats)
     });
 
     const includedPaths = new Set();

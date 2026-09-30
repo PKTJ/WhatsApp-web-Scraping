@@ -20,6 +20,7 @@ Setiap kontak/grup yang berhasil di-scrape disimpan sebagai **satu file JSON ter
 whatsapp-export-YYYYMMDD-HHMMSS.zip
 └── whatsapp-export-YYYYMMDD-HHMMSS/
     ├── export-summary.json              ← ringkasan semua chat + daftar error + indeks file
+    ├── exported-contacts.csv           ← nama/ID kontak yang berhasil diekspor
     ├── messages/
     │   ├── Budi Santoso-433e5c.json     ← satu kontak = satu file
     │   ├── Grup Kuliah-075957.json      ← satu grup = satu file
@@ -28,6 +29,34 @@ whatsapp-export-YYYYMMDD-HHMMSS.zip
         └── <nama chat>-<hash>/
             └── image-<sha256>.png
 ```
+
+`exported-contacts.csv` dapat diunggah kembali dari side panel melalui **Muat daftar CSV / Excel**. File `.xlsx` didukung langsung, sedangkan `.xls` lama perlu dikonversi terlebih dahulu. Tombol **Balik ceklis** membalik seluruh pilihan saat ini.
+
+### Pencocokan nama mirip dan kata kunci
+
+Pilih mode sebelum mengunggah file atau memindai ulang:
+
+- **Cerdas — nama mirip / kata kunci** (default): ID angka diprioritaskan, lalu nama persis, kemudian nama setelah normalisasi kapital, aksen Latin, spasi, tanda baca, emoji, dan karakter format tersembunyi. Bila belum cocok, kata utuh dapat dicocokkan tanpa bergantung urutannya; salah ketik ringan diperiksa dengan kemiripan Levenshtein minimal **85%**, juga pada kata yang diurutkan.
+- **Persis — nama / ID sama**: hanya nama persis atau ID angka yang sama, tanpa normalisasi dan pencocokan mirip.
+
+Nama atau kata kunci ditulis pada kolom nama yang sudah didukung (`chat_name`, `nama`, `nama_kontak`, `contact_name`, `name`, atau `kontak`), atau satu nama per baris tanpa header. Contoh mode cerdas:
+
+| Nama/kata kunci di CSV | Nama chat WhatsApp | Hasil jika kandidatnya tunggal |
+| --- | --- | --- |
+| `rene toko` | `RÉNÉ - TOKO 🌟` | Normalisasi |
+| `Budi Santoso` | `Pak Budi Santoso` | Kata kunci utuh |
+| `Marketing` | `Tim Marketing Jakarta` | Kata kunci utuh |
+| `Budi Santso` | `Budi Santoso` | Salah ketik ringan |
+
+Pengaman dan cara membaca hasil:
+
+- Jika kata kunci mengarah ke beberapa chat, atau dua skor terbaik berbeda kurang dari 5 poin persentase, baris ditandai **perlu diperiksa**, bukan otomatis diceklis. Buka **Rincian pencocokan** untuk melihat nama asli, alasan kecocokan, dan memilih/membatalkan kandidat secara manual. Skor kemiripan bukan jaminan identitas kontak.
+- Kata pendek/generik saja (misalnya `Ani`, `Pak`, atau `Grup`) tidak dipakai untuk pencocokan mirip. Dibutuhkan setidaknya satu kata non-generik dengan 4 huruf. `Ani` tidak dianggap sama dengan `Anita`. Nomor telepon tidak dicocokkan secara fuzzy, dan nomor yang diketahui berbeda tidak ditimpa oleh kecocokan nama.
+- Angka/tahun yang berbeda dan label satu huruf berbeda dilindungi: `Alumni Bandung 2024` tidak dianggap typo dari `Alumni Bandung 2025`. Kata kunci tanpa tahun seperti `Alumni Bandung` tetap dapat menemukan keduanya, tetapi perlu diperiksa bila ambigu.
+- Bila tersedia, `community_name` tetap membatasi pencocokan nama ke komunitas yang sama (normalisasi diperbolehkan pada mode cerdas, fuzzy tidak). ID angka yang sama tetap lebih diutamakan daripada nama/komunitas. Nama persis/ternormalisasi yang sama dapat memilih beberapa chat, seperti perilaku nama persis sebelumnya; sertakan komunitas atau nomor untuk membedakan.
+- Ringkasan menghitung **baris file yang cocok**, terpisah dari **jumlah chat unik**. Baris duplikat atau satu nama yang cocok dengan beberapa chat tidak lagi membuat hitungan “tidak ditemukan” keliru. Pilihan manual tidak mengubah hitungan kecocokan otomatis.
+- Unggah menambahkan ceklis tanpa menghapus pilihan sebelumnya. Nama file, mode, daftar impor, dan pilihan disimpan saat panel ditutup. Mengubah mode tidak langsung mengubah ceklis; unggah ulang atau pindai ulang untuk menerapkannya. File juga boleh dimuat sebelum scan.
+- Seluruh pencocokan berjalan lokal, tanpa layanan/API atau dependensi tambahan. Hanya chat yang sudah ditemukan scanner yang dapat dicocokkan. Nama yang berubah total, singkatan bebas, dan chat yang belum ter-scan tidak dijamin terdeteksi. Nama di atas 256 karakter tidak dihitung edit distance-nya, tetapi masih bisa cocok persis/kata kunci.
 
 Aturan penamaan file JSON:
 

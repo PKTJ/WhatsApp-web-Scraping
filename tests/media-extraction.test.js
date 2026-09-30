@@ -4,6 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const { webcrypto } = require('node:crypto');
+const ContactList = require('../contact-list.js');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 class Element {
@@ -40,7 +41,7 @@ class Image extends Element {}
 class Canvas extends Element {}
 function setup(extraNames = []) {
   const context = vm.createContext({
-    Blob, crypto: webcrypto, anonymousMediaIds: new WeakMap(),
+    Blob, crypto: webcrypto, anonymousMediaIds: new WeakMap(), ContactList,
     normalizeImageMime: () => 'image/png', imageExtensionForMime: () => 'png',
     sanitizePathSegment: (value) => value,
     // Tidak ada permintaan STOP dalam skenario unit test.
@@ -208,8 +209,8 @@ test('ZIP contains one entry for shared image path', async () => {
   const image = { relative_path: 'img/A/hash.png', blob: new Blob(['photo']) };
   const { blob: files, jsonFiles } = await api.buildExportZipBundle({ exportRoot: 'export', payload: {},
     exportedChats: [{ image_files: [image, image] }, { image_files: [image] }] });
-  // Dua file JSON per chat + export-summary.json + satu gambar bersama.
-  assert.equal(files.length, 4);
+  // Dua file JSON per chat + export-summary.json + CSV + satu gambar bersama.
+  assert.equal(files.length, 5);
   assert.equal(jsonFiles.length, 2);
   assert.equal(files.filter((file) => file.path.endsWith('.png')).length, 1);
 });
@@ -237,7 +238,11 @@ test('every scraped chat becomes its own JSON file inside messages/', async () =
   assert.ok(messageFiles.every((file) => file.path.endsWith('.json')));
   // Ringkasan gabungan berada di akar arsip, bukan di dalam messages/.
   assert.ok(files.some((file) => file.path === 'export/export-summary.json'));
-  assert.equal(files.length, 5);
+  assert.equal(files.length, 6);
+  const csv = files.find((file) => file.path === 'export/exported-contacts.csv');
+  assert.ok(csv);
+  assert.deepEqual(ContactList.contactsFromRows(ContactList.parseCsv(csv.data)).map((entry) => entry.name),
+    ['Grup A', 'Budi', 'Grup A']);
 
   const first = JSON.parse(messageFiles[0].data);
   assert.equal(first.chat.chat_name, 'Grup A');
@@ -367,8 +372,8 @@ test('two anonymous captionless photos keep separate IDs and both reach ZIP file
   api.createZipBlob = (entries) => entries;
   const { blob: entries } = await api.buildExportZipBundle({ exportRoot: 'export', payload: {},
     exportedChats: [{ image_files: files }] });
-  // Satu JSON chat + export-summary.json + dua gambar berbeda.
-  assert.equal(entries.length, 4);
+  // Satu JSON chat + ringkasan + CSV + dua gambar berbeda.
+  assert.equal(entries.length, 5);
 });
 
 test('media-only rows without standard classes or caption metadata are discovered', () => {
@@ -629,7 +634,7 @@ test('already exported images still reach the ZIP after an early stop', async ()
   });
   const { blob: entries } = await api.buildExportZipBundle({ exportRoot: 'export', payload: {},
     exportedChats: [{ image_files: [{ ...saved, blob: new Blob(['photo']) }] }] });
-  // JSON chat + export-summary.json + satu gambar yang sempat tersimpan sebelum berhenti.
-  assert.equal(entries.length, 3);
+  // JSON chat + ringkasan + CSV + gambar yang sempat tersimpan.
+  assert.equal(entries.length, 4);
 });
 

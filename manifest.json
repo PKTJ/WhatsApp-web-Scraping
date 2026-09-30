@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WhatsApp JSON + Image Exporter",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "description": "Ekspor chat WhatsApp Web ke JSON dengan scan Chats + Community snapshot deterministik, hanya subgroup yang diikuti, search, scroll dinamis, reply sequence, dan gambar readable.",
   "permissions": [
     "downloads",
@@ -18,6 +18,7 @@
         "https://web.whatsapp.com/*"
       ],
       "js": [
+        "contact-list.js",
         "content.js"
       ],
       "run_at": "document_idle"
