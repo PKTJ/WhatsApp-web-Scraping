@@ -105,7 +105,26 @@
       <button id="exportButton" type="button" class="primary export" disabled>
         Ekspor chat terpilih
       </button>
+      <button id="stopButton" type="button" class="danger export" hidden>
+        Hentikan &amp; simpan sekarang
+      </button>
       <p>Jangan berinteraksi dengan WhatsApp Web selama scan atau ekspor berlangsung.</p>
+    </div>
+
+    <div id="stopDialog" class="dialog-backdrop" hidden>
+      <div class="dialog" role="alertdialog" aria-modal="true"
+           aria-labelledby="stopDialogTitle" aria-describedby="stopDialogBody">
+        <h2 id="stopDialogTitle">Hentikan proses sekarang?</h2>
+        <p id="stopDialogBody">
+          Proses akan berhenti di titik aman terdekat dan seluruh data yang sudah
+          terkumpul langsung diekspor menjadi satu arsip ZIP. Chat yang belum
+          sempat diproses tidak akan ikut.
+        </p>
+        <div class="dialog-actions">
+          <button id="stopCancel" type="button" class="secondary">Batal, lanjutkan</button>
+          <button id="stopConfirm" type="button" class="danger">Ya, hentikan &amp; simpan</button>
+        </div>
+      </div>
     </div>
   </main>
 

@@ -37,8 +37,11 @@
 * { box-sizing: border-box; }
 
 body {
-  width: 470px;
-  min-height: 620px;
+  /* Side panel memiliki lebar yang dapat diubah pengguna; lebar tetap 470px
+     akan memunculkan scrollbar horizontal saat panel dipersempit. */
+  width: 100%;
+  min-width: 320px;
+  min-height: 100vh;
   margin: 0;
   background: var(--bg);
   color: var(--text);
@@ -240,6 +243,7 @@ h2 {
 
 .primary,
 .secondary,
+.danger,
 .icon-button {
   border-radius: 8px;
   font-weight: 700;
@@ -260,6 +264,59 @@ h2 {
 }
 
 .secondary:hover:not(:disabled) { border-color: var(--accent); }
+
+/* Tombol hentikan memakai warna danger agar jelas berbeda dari aksi normal. */
+.danger {
+  border: 1px solid var(--danger);
+  background: var(--danger);
+  color: #fff;
+}
+
+.danger:hover:not(:disabled) { filter: brightness(0.92); }
+
+/* --- Dialog konfirmasi hentikan --- */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(17, 27, 33, 0.55);
+}
+
+.dialog-backdrop[hidden] { display: none; }
+
+.dialog {
+  width: 100%;
+  max-width: 340px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.dialog h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.dialog p {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.dialog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.dialog-actions button { padding: 10px 12px; font-size: 12px; }
 
 .compact { padding: 8px 11px; font-size: 11px; }
 

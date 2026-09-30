@@ -4,8 +4,11 @@
   "version": "0.9.2",
   "description": "Ekspor chat WhatsApp Web ke JSON dengan scan Chats + Community snapshot deterministik, hanya subgroup yang diikuti, search, scroll dinamis, reply sequence, dan gambar readable.",
   "permissions": [
-    "downloads"
+    "downloads",
+    "sidePanel",
+    "storage"
   ],
+  "minimum_chrome_version": "114",
   "host_permissions": [
     "https://web.whatsapp.com/*"
   ],
@@ -24,7 +27,9 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "WhatsApp JSON + Image Exporter",
-    "default_popup": "popup.html"
+    "default_title": "WhatsApp JSON + Image Exporter"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
   }
 }

@@ -12,11 +12,116 @@ const clearSearchButton = document.getElementById("clearSearch");
 const selectionMeta = document.getElementById("selectionMeta");
 const resultsSection = document.getElementById("resultsSection");
 const resultSummary = document.getElementById("resultSummary");
+const stopButton = document.getElementById("stopButton");
+const stopDialog = document.getElementById("stopDialog");
+const stopConfirm = document.getElementById("stopConfirm");
+const stopCancel = document.getElementById("stopCancel");
 
 let chats = [];
 let busy = false;
 const selectedChatIds = new Set();
 const liveResults = new Map();
+
+// --- Persistensi sesi -------------------------------------------------------
+// Side panel dapat ditutup atau Chrome direstart kapan saja. Seluruh state UI
+// disimpan lewat service worker (chrome.storage.local) dan dipulihkan saat
+// panel dibuka kembali, sehingga progres tidak hilang.
+let restoring = false;
+let saveTimer = null;
+
+function collectSessionState() {
+  return {
+    chats,
+    selected_chat_ids: [...selectedChatIds],
+    live_results: [...liveResults.values()],
+    search_query: chatSearchInput.value,
+    status_text: statusElement.textContent,
+    status_error: statusElement.classList.contains("error"),
+    settings: {
+      max_messages: maxMessagesInput.value,
+      load_wait_seconds: loadWaitSecondsInput.value,
+      export_images: exportImagesInput.checked,
+      image_wait_seconds: imageWaitSecondsInput.value
+    }
+  };
+}
+
+function persistState() {
+  // Jangan menulis balik saat sedang memulihkan agar state lama tidak tertimpa.
+  if (restoring) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    chrome.runtime
+      .sendMessage({ type: "SAVE_SESSION_STATE", state: collectSessionState() })
+      .catch(() => {});
+  }, 150);
+}
+
+async function restoreState() {
+  restoring = true;
+
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "LOAD_SESSION_STATE" });
+    const state = response?.state;
+    if (!state || typeof state !== "object") return;
+
+    const settings = state.settings || {};
+    if (settings.max_messages) maxMessagesInput.value = settings.max_messages;
+    if (settings.load_wait_seconds) loadWaitSecondsInput.value = settings.load_wait_seconds;
+    if (settings.image_wait_seconds) imageWaitSecondsInput.value = settings.image_wait_seconds;
+    if (typeof settings.export_images === "boolean") {
+      exportImagesInput.checked = settings.export_images;
+    }
+
+    if (Array.isArray(state.chats)) chats = state.chats;
+    if (Array.isArray(state.selected_chat_ids)) {
+      selectedChatIds.clear();
+      for (const id of state.selected_chat_ids) selectedChatIds.add(id);
+    }
+    if (typeof state.search_query === "string") {
+      chatSearchInput.value = state.search_query;
+    }
+
+    // Hasil ekspor dari background (__key) maupun dari snapshot panel.
+    const storedResults = Array.isArray(state.live_results) ? state.live_results : [];
+    liveResults.clear();
+    for (const result of storedResults) {
+      if (result?.chat_name) liveResults.set(resultKey(result), result);
+    }
+
+    renderChats();
+    renderResults();
+
+    if (state.status_text) {
+      setStatus(state.status_text, Boolean(state.status_error));
+    }
+
+    // Panel mungkin ditutup saat proses masih berjalan. Tanyakan kondisi nyata
+    // ke content script supaya tombol Hentikan muncul kembali, bukan tombol
+    // Ekspor yang menyesatkan.
+    await syncRuntimeState();
+  } catch (_error) {
+    // Storage tidak tersedia: jalankan panel dengan state kosong.
+  } finally {
+    restoring = false;
+  }
+}
+
+async function syncRuntimeState() {
+  try {
+    const tab = await getActiveWhatsAppTab();
+    const runtime = await chrome.tabs.sendMessage(tab.id, { type: "GET_RUNTIME_STATE" });
+    if (runtime?.ok && (runtime.export_in_progress || runtime.scan_in_progress)) {
+      setBusy(true);
+      if (runtime.stop_requested) {
+        stopButton.disabled = true;
+        stopButton.textContent = "Menghentikan…";
+      }
+    }
+  } catch (_error) {
+    // Tab WhatsApp tidak tersedia / content script belum siap: abaikan.
+  }
+}
 
 function normalizeSearch(value) {
   return String(value || "")
@@ -29,6 +134,7 @@ function normalizeSearch(value) {
 function setStatus(message, isError = false) {
   statusElement.textContent = message;
   statusElement.classList.toggle("error", isError);
+  persistState();
 }
 
 function getFilteredChats() {
@@ -70,6 +176,7 @@ function updateSelectionUi() {
   exportButton.disabled = busy || selectedCount === 0;
   chatSearchInput.disabled = busy || chats.length === 0;
   clearSearchButton.hidden = chatSearchInput.value.length === 0;
+  persistState();
 }
 
 function setBusy(isBusy) {
@@ -79,17 +186,67 @@ function setBusy(isBusy) {
   loadWaitSecondsInput.disabled = isBusy;
   exportImagesInput.disabled = isBusy;
   imageWaitSecondsInput.disabled = isBusy || !exportImagesInput.checked;
+  // Tombol hentikan hanya relevan selama proses berjalan.
+  stopButton.hidden = !isBusy;
+  exportButton.hidden = isBusy;
+  if (!isBusy) {
+    stopButton.disabled = false;
+    stopButton.textContent = "Hentikan & simpan sekarang";
+    closeStopDialog();
+  }
   updateSelectionUi();
 }
 
-async function getActiveWhatsAppTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+function openStopDialog() {
+  stopDialog.hidden = false;
+  stopConfirm.focus();
+}
 
-  if (!tab?.id || !tab.url?.startsWith("https://web.whatsapp.com/")) {
-    throw new Error("Tab aktif bukan WhatsApp Web.");
+function closeStopDialog() {
+  stopDialog.hidden = true;
+}
+
+// Konfirmasi wajib: STOP membuang sisa antrean, jadi tidak boleh terpicu
+// hanya karena salah klik.
+async function confirmStop() {
+  closeStopDialog();
+  stopButton.disabled = true;
+  stopButton.textContent = "Menghentikan…";
+  setStatus("Permintaan berhenti dikirim. Menyelesaikan langkah aman lalu menyimpan arsip…");
+
+  try {
+    const response = await sendToContent({ type: "STOP_EXPORT" });
+    if (!response?.ok) {
+      throw new Error(response?.error || "Proses tidak dapat dihentikan.");
+    }
+  } catch (error) {
+    stopButton.disabled = false;
+    stopButton.textContent = "Hentikan & simpan sekarang";
+    setStatus(error.message, true);
+  }
+}
+
+async function getActiveWhatsAppTab() {
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+  if (active?.id && active.url?.startsWith("https://web.whatsapp.com/")) {
+    return active;
   }
 
-  return tab;
+  // Side panel tetap terbuka saat pengguna berpindah ke tab lain. Cari tab
+  // WhatsApp Web mana pun di jendela ini supaya proses tidak putus hanya karena
+  // tab aktif bukan WhatsApp.
+  const [fallback] = await chrome.tabs.query({
+    url: "https://web.whatsapp.com/*",
+    currentWindow: true
+  });
+
+  if (fallback?.id) return fallback;
+
+  const [anyWindow] = await chrome.tabs.query({ url: "https://web.whatsapp.com/*" });
+  if (anyWindow?.id) return anyWindow;
+
+  throw new Error("Tab WhatsApp Web tidak ditemukan. Buka https://web.whatsapp.com lalu coba lagi.");
 }
 
 async function sendToContent(message) {
@@ -181,6 +338,11 @@ function clearResults() {
   liveResults.clear();
   resultSummary.replaceChildren();
   resultsSection.hidden = true;
+  // Hapus juga snapshot di service worker supaya hasil lama tidak muncul lagi
+  // ketika panel dibuka berikutnya.
+  chrome.runtime
+    .sendMessage({ type: "SAVE_SESSION_STATE", state: { live_results: [] } })
+    .catch(() => {});
 }
 
 function reasonLabel(reason) {
@@ -192,6 +354,7 @@ function reasonLabel(reason) {
     message_scroller_not_found: "Area scroll pesan tidak ditemukan.",
     initial_messages_only: "Hanya pesan yang sudah terlihat yang dapat dibaca.",
     export_error: "Chat gagal diekspor.",
+    stopped_by_user: "Dihentikan manual; pesan yang sempat terkumpul tetap disimpan.",
     community_not_member: "Dilewati karena akun ini bukan anggota subgroup tersebut."
   };
 
@@ -225,6 +388,7 @@ function renderResults(finalResults = null) {
   }
 
   resultSummary.replaceChildren();
+  persistState();
 
   for (const result of liveResults.values()) {
     const item = document.createElement("div");
@@ -409,7 +573,9 @@ scanButton.addEventListener("click", async () => {
     ].filter(Boolean).join(" · ");
 
     setStatus(
-      `${chats.length} chat ditemukan${extras ? ` · ${extras}` : ""}. Gunakan pencarian untuk menemukan chat dengan cepat.`
+      response.stopped_by_user
+        ? `Pemindaian dihentikan. ${chats.length} chat sempat ditemukan${extras ? ` · ${extras}` : ""} dan tetap dapat diekspor.`
+        : `${chats.length} chat ditemukan${extras ? ` · ${extras}` : ""}. Gunakan pencarian untuk menemukan chat dengan cepat.`
     );
   } catch (error) {
     chats = [];
@@ -502,9 +668,12 @@ exportButton.addEventListener("click", async () => {
     const folderText = response.outputDirectory
       ? ` Folder: Downloads/${response.outputDirectory}.`
       : "";
+    const jsonText = Number(response.jsonFiles || 0)
+      ? ` ${Number(response.jsonFiles)} file JSON terpisah di folder messages/.`
+      : "";
 
     setStatus(
-      `Selesai: ${attemptedCount} chat dicoba, ${response.exportedChats} berhasil dibaca, dan ${response.exportedMessages} pesan diekspor.${imageText}${suffix}${folderText}`
+      `${response.stoppedByUser ? "Dihentikan" : "Selesai"}: ${attemptedCount} chat dicoba, ${response.exportedChats} berhasil dibaca, dan ${response.exportedMessages} pesan diekspor.${imageText}${suffix}${folderText}${jsonText}`
     );
   } catch (error) {
     setStatus(error.message, true);
@@ -513,5 +682,26 @@ exportButton.addEventListener("click", async () => {
   }
 });
 
+// Simpan setiap perubahan pengaturan agar tetap sama setelah panel ditutup.
+for (const input of [maxMessagesInput, loadWaitSecondsInput, imageWaitSecondsInput]) {
+  input.addEventListener("change", persistState);
+}
+
+stopButton.addEventListener("click", openStopDialog);
+stopCancel.addEventListener("click", closeStopDialog);
+stopConfirm.addEventListener("click", confirmStop);
+
+// Klik area gelap di luar kotak dialog = batal.
+stopDialog.addEventListener("click", (event) => {
+  if (event.target === stopDialog) closeStopDialog();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !stopDialog.hidden) closeStopDialog();
+});
+
 renderChats();
 setBusy(false);
+// Pulihkan state terakhir (daftar chat, pilihan, hasil, status) setiap kali
+// side panel dibuka kembali — termasuk setelah pindah tab atau restart Chrome.
+restoreState();

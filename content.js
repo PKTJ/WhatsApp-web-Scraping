@@ -2,9 +2,24 @@
   "use strict";
 
   const chatRegistry = new Map();
+  const anonymousMediaIds = new WeakMap();
   let scanGeneration = 0;
   let exportInProgress = false;
   let scanInProgress = false;
+  // Permintaan STOP dari panel. Loop scroll, antrean gambar, dan queue chat
+  // memeriksa flag ini di titik aman lalu keluar lebih awal supaya data yang
+  // sudah terkumpul tetap diekspor, bukan dibuang.
+  let stopRequested = false;
+
+  function requestStop() {
+    if (!exportInProgress && !scanInProgress) return false;
+    stopRequested = true;
+    return true;
+  }
+
+  function isStopRequested() {
+    return stopRequested;
+  }
 
   async function waitUntil(predicate, timeoutMs = 2_500, intervalMs = 120) {
     const deadline = Date.now() + timeoutMs;
@@ -47,6 +62,25 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "STOP_EXPORT") {
+      const accepted = requestStop();
+      sendResponse({
+        ok: accepted,
+        error: accepted ? null : "Tidak ada proses yang sedang berjalan."
+      });
+      return undefined;
+    }
+
+    if (message?.type === "GET_RUNTIME_STATE") {
+      sendResponse({
+        ok: true,
+        export_in_progress: exportInProgress,
+        scan_in_progress: scanInProgress,
+        stop_requested: stopRequested
+      });
+      return undefined;
+    }
+
     if (message?.type === "SCAN_ALL_CHATS") {
       if (scanInProgress) {
         sendResponse({ ok: false, error: "Pemindaian chat lain masih berlangsung." });
@@ -59,6 +93,7 @@
       }
 
       scanInProgress = true;
+      stopRequested = false;
       scanAllChats(message?.options || {})
         .then(sendResponse)
         .catch((error) =>
@@ -66,6 +101,7 @@
         )
         .finally(() => {
           scanInProgress = false;
+          stopRequested = false;
         });
 
       return true;
@@ -83,6 +119,7 @@
       }
 
       exportInProgress = true;
+      stopRequested = false;
 
       exportSelectedChats(message.chatIds, message.options)
         .then(sendResponse)
@@ -91,6 +128,7 @@
         )
         .finally(() => {
           exportInProgress = false;
+          stopRequested = false;
         });
 
       return true;
@@ -183,6 +221,7 @@
 
     return {
       ok: true,
+      stopped_by_user: isStopRequested(),
       chats: entries.map(publicChatEntry),
       scan_stats: {
         discovered_chat_count: entries.length,
@@ -235,6 +274,10 @@
       await waitForSidebarRender(scroller, 550);
 
       while (step < maxScanSteps) {
+        // Titik henti saat memindai sidebar: chat yang sudah ditemukan tetap
+        // dipertahankan sehingga daftar hasil scan tidak hilang.
+        if (isStopRequested()) break;
+
         const currentTop = Math.max(0, scroller.scrollTop);
 
         // Community rows pada WhatsApp Web memakai virtualized DOM. Pada satu
@@ -2169,12 +2212,21 @@
     const exportStartedAt = new Date();
     const exportRoot = `whatsapp-export-${formatFilenameDate(exportStartedAt)}`;
     options.exportRoot = exportRoot;
+    // Database internal dibatasi satu arsip, agar ekspor berikutnya tetap lengkap.
+    options.mediaDatabase = { units: new Map(), files: new Map() };
 
     const exportedChats = [];
     const errors = [];
     const chatResults = [];
+    let stoppedEarly = false;
 
     for (let index = 0; index < selectedEntries.length; index += 1) {
+      // Titik henti antar-chat: chat yang sudah selesai tetap masuk arsip.
+      if (isStopRequested()) {
+        stoppedEarly = true;
+        break;
+      }
+
       const entry = selectedEntries[index];
       const currentChatIndex = index + 1;
       const totalChats = selectedEntries.length;
@@ -2311,7 +2363,14 @@
       output: {
         directory: exportRoot,
         default_location: `Downloads/${exportRoot}`,
-        json_file: "messages/export.json",
+        // v0.9.3: setiap kontak/grup memiliki satu file JSON sendiri di dalam
+        // folder messages. Ringkasan gabungan seluruh chat, daftar file, dan
+        // error disimpan terpisah di akar arsip supaya folder messages benar-benar
+        // hanya berisi file per chat.
+        messages_directory: "messages",
+        json_file_mode: "one_file_per_chat",
+        json_file_naming: "messages/<nama chat>-<hash nama>.json",
+        summary_file: "export-summary.json",
         media_directory: options.exportImages ? "img" : null
       },
       export_settings: {
@@ -2339,6 +2398,7 @@
         reply_sequence_resolution: "message_id_then_nearest_previous_preview_match"
       },
       export_summary: {
+        stopped_by_user: stoppedEarly,
         requested_chat_count: selectedEntries.length,
         attempted_chat_count: chatResults.length,
         exported_chat_count: exportedChats.length,
@@ -2355,6 +2415,9 @@
         per_chat: chatResults
       },
       warnings: [
+        stoppedEarly
+          ? "Ekspor dihentikan manual oleh pengguna. Arsip ini hanya memuat chat dan pesan yang sempat terkumpul sampai tombol Hentikan ditekan."
+          : null,
         "Hanya pesan yang berhasil dirender oleh WhatsApp Web yang dapat diekspor.",
         "Angka maksimum pesan merupakan target. Scroll berlangsung dinamis sampai target tercapai, awal chat/no-progress terdeteksi, atau guard keselamatan internal tercapai.",
         options.exportImages
@@ -2366,13 +2429,17 @@
         "reply_to.sequence hanya terisi jika pesan target juga termasuk dalam rentang pesan yang berhasil diekspor dan dapat dicocokkan dengan cukup yakin; jika tidak, nilainya null.",
         "Selector DOM WhatsApp Web dapat berubah dan mungkin memerlukan pembaruan ekstensi.",
         "Urutan pesan diprioritaskan berdasarkan posisi visual dari atas ke bawah pada DOM WhatsApp Web; timestamp digunakan sebagai fallback.",
-        "Chat yang gagal ditemukan atau gagal dibuka tetap tercatat di export_summary.per_chat dengan status error dan tetap dihitung pada attempted_chat_count."
-      ],
+        "Chat yang gagal ditemukan atau gagal dibuka tetap tercatat di export_summary.per_chat dengan status error dan tetap dihitung pada attempted_chat_count.",
+        "Setiap kontak/grup disimpan sebagai satu file JSON terpisah di folder messages/. Ringkasan seluruh chat, daftar error, dan indeks file berada di export-summary.json pada akar arsip."
+      ].filter(Boolean),
       errors,
-      chats: exportedChats
+      // chats sengaja TIDAK disertakan di sini. Payload ini dipakai sebagai
+      // envelope bersama untuk setiap file JSON per chat, dan menyalin seluruh
+      // chat ke dalamnya akan menggandakan isi arsip berkali-kali.
+      chat_count: exportedChats.length
     };
 
-    const zipBlob = await buildExportZipBundle({
+    const { blob: zipBlob, jsonFiles } = await buildExportZipBundle({
       exportRoot,
       payload,
       exportedChats
@@ -2398,6 +2465,7 @@
 
     return {
       ok: true,
+      stoppedByUser: stoppedEarly,
       attemptedChats: chatResults.length,
       exportedChats: exportedChats.length,
       exportedMessages: exportedChats.reduce(
@@ -2411,6 +2479,9 @@
       lowQualityImages: aggregateMedia.images_low_quality,
       failedImages: aggregateMedia.images_failed,
       outputDirectory: exportRoot,
+      // Jumlah file JSON per chat yang benar-benar masuk ke folder messages.
+      jsonFiles: jsonFiles.length,
+      jsonFilePaths: jsonFiles.map((file) => file.relative_path),
       errors,
       chatResults
     };
@@ -3222,7 +3293,7 @@
     while (Date.now() < deadline) {
       if (!main.isConnected) break;
 
-      const hasMessage = Boolean(main.querySelector("[data-pre-plain-text]"));
+      const hasMessage = findRenderedMessageRoots(main).length > 0;
       const scroller = findMessageScroller(main);
 
       // Header sering siap lebih dulu daripada virtual message scroller.
@@ -3408,6 +3479,12 @@
       stopReason = "message_scroller_not_found";
     } else {
       for (let step = 0; step < options.dynamicScrollHardCap; step += 1) {
+        // Titik henti di tengah chat: pesan yang sudah terkumpul dipertahankan.
+        if (isStopRequested()) {
+          stopReason = "stopped_by_user";
+          break;
+        }
+
         if (collector.size >= options.maxMessages) {
           stopReason = "target_reached";
           break;
@@ -3623,7 +3700,7 @@
       Math.abs(Number(scroller.scrollTop || 0) - currentTop) < 2
     ) {
       try {
-        main.querySelector("[data-pre-plain-text]")?.scrollIntoView({
+        findRenderedMessageRoots(main)[0]?.scrollIntoView({
           block: "start",
           inline: "nearest"
         });
@@ -3753,7 +3830,7 @@
     if (!main) return null;
 
     const candidates = new Set();
-    const messageNodes = Array.from(main.querySelectorAll("[data-pre-plain-text]"));
+    const messageNodes = findRenderedMessageRoots(main);
 
     // Prioritas: naik dari bubble pesan yang benar-benar dirender. Ini tidak
     // bergantung pada nama class maupun overflow-y tertentu.
@@ -3802,7 +3879,7 @@
   function scrollerScore(element, main) {
     const rectangle = element.getBoundingClientRect();
     const scrollRange = Math.max(0, element.scrollHeight - element.clientHeight);
-    const messageCount = element.querySelectorAll("[data-pre-plain-text]").length;
+    const messageCount = findRenderedMessageRoots(element).length;
     let overflowY = "";
     try {
       overflowY = String(getComputedStyle(element).overflowY || "").toLowerCase();
@@ -3912,17 +3989,31 @@
     return (sorted[middle - 1] + sorted[middle]) / 2;
   }
 
+  function findRenderedMessageRoots(main) {
+    const nodes = Array.from(main.querySelectorAll(
+      '[data-pre-plain-text], .message-in, .message-out, [data-id^="true_"], [data-id^="false_"], [id^="true_"], [id^="false_"]'
+    ));
+    // Beberapa layout media-only hanya menyediakan row, tanpa metadata caption.
+    // Batasi fallback ke row berisi media agar header/sidebar tidak menjadi pesan.
+    for (const row of main.querySelectorAll('[role="row"]')) {
+      if (nodes.some((node) => row.contains(node) || node.contains(row))) continue;
+      if (findMessageImages(row).length > 0) nodes.push(row);
+    }
+    const roots = [...new Set(nodes.map(findMessageBubble))];
+    // Satu bubble album dapat berisi beberapa node metadata/ID tile.
+    return roots.filter((root) => !roots.some((other) => other !== root && other.contains(root)));
+  }
+
   function collectRenderedMessages(main, captureOrderStart) {
-    const metadataNodes = Array.from(
-      main.querySelectorAll("[data-pre-plain-text]")
-    );
+    const metadataNodes = findRenderedMessageRoots(main);
     const results = [];
 
     metadataNodes.forEach((metadataNode, index) => {
       try {
-        results.push(
-          parseMessageNode(metadataNode, captureOrderStart + index)
-        );
+        // parseMessageNode() mengembalikan null untuk bubble di luar lingkup
+        // (video, stiker, dokumen tanpa caption) sehingga tidak masuk hasil.
+        const message = parseMessageNode(metadataNode, captureOrderStart + index);
+        if (message) results.push(message);
       } catch (_error) {
         // Satu pesan yang formatnya tidak dikenali tidak boleh menggagalkan ekspor.
       }
@@ -3934,13 +4025,25 @@
   function parseMessageNode(metadataNode, captureOrder) {
     const bubble = findMessageBubble(metadataNode);
     const metadataRaw = cleanText(
-      metadataNode.getAttribute("data-pre-plain-text")
+      metadataNode.getAttribute("data-pre-plain-text") ||
+      bubble.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text")
     );
     const parsedMetadata = parsePrePlainText(metadataRaw);
     const direction = detectDirection(bubble);
-    const text = extractMessageText(metadataNode, bubble);
-    const media = detectMedia(bubble, text);
+    const media = detectMedia(bubble);
+    // BUG FIX: sebelumnya mode captionOnly hanya aktif untuk video/gambar,
+    // sehingga stiker/voice note jatuh ke fallback span[dir] dan menangkap jam
+    // pesan ("22:47") sebagai teks. Sekarang SEMUA bubble bermedia memakai
+    // captionOnly, jadi hanya caption asli yang diambil.
+    const text = extractMessageText(metadataNode, bubble, Boolean(media));
     const type = detectMessageType(text, media, bubble);
+
+    // Media di luar gambar tidak diekspor. Tanpa caption, tidak ada yang
+    // tersisa untuk disimpan sehingga bubble dilewati sepenuhnya.
+    if (type === null) {
+      return null;
+    }
+
     const nativeId = extractNativeMessageId(metadataNode, bubble);
     const idSource = [
       nativeId,
@@ -3951,7 +4054,16 @@
       .filter(Boolean)
       .join("|");
 
-    const id = nativeId || `msg-${simpleHash(idSource)}`;
+    let id = nativeId || `msg-${simpleHash(idSource)}`;
+    if (!nativeId && media?.detectedAs === "image") {
+      // Caption bukan identitas foto. Dua foto tanpa metadata sebelumnya sama-sama
+      // mendapat hash("img"), lalu saling menimpa di collector/antrean capture.
+      // WeakMap mempertahankan ID selama bubble hidup tanpa menahan DOM lama.
+      if (!anonymousMediaIds.has(bubble)) {
+        anonymousMediaIds.set(bubble, `msg-media-${crypto.randomUUID()}`);
+      }
+      id = anonymousMediaIds.get(bubble);
+    }
 
     return {
       id,
@@ -3964,44 +4076,29 @@
       media: buildInitialMediaMetadata(media),
       reply_to: extractReplyPreview(bubble, text, nativeId),
       _capture_order: captureOrder,
-      // Satu kandidat terbaik saja per pesan (anti-double). Sebelumnya SEMUA
-      // kandidat (img + background fallback) ikut diekspor sehingga satu gambar
-      // fisik bisa tersimpan lebih dari sekali.
-      _image_candidates: media?.detectedAs === "image" && media.imageElement
-        ? [buildImageCandidate(media.imageElement)].filter(Boolean)
+      // Semua tile album; representasi ganda disaring di findMessageImages().
+      _image_candidates: media?.detectedAs === "image"
+        ? media.imageElements.map(buildImageCandidate).filter(Boolean)
         : []
     };
   }
 
+  // Metadata media hanya relevan untuk gambar; tipe lain tidak pernah sampai
+  // ke sini karena sudah dilewati di parseMessageNode().
   function buildInitialMediaMetadata(media) {
-    if (!media?.detectedAs) {
+    if (media?.detectedAs !== "image") {
       return null;
     }
 
-    const result = {
-      export_status: "metadata_only"
-    };
+    const result = { export_status: "metadata_only" };
+    const candidate = buildImageCandidate(media.imageElement);
+    const width = Number(candidate?.width || 0);
+    const height = Number(candidate?.height || 0);
 
-    if (media.filename) {
-      result.filename = media.filename;
-    }
-
-    if (
-      Number.isFinite(media.durationSeconds) &&
-      ["video", "audio", "voice_note", "gif"].includes(media.detectedAs)
-    ) {
-      result.duration_seconds = media.durationSeconds;
-    }
-
-    if (media.detectedAs === "image" && media.imageElement) {
-      const candidate = buildImageCandidate(media.imageElement);
-      const width = Number(candidate?.width || 0);
-      const height = Number(candidate?.height || 0);
-      if (width > 0) result.width = width;
-      if (height > 0) result.height = height;
-      result.source = "rendered_dom";
-      if (candidate?.element_kind) result.render_kind = candidate.element_kind;
-    }
+    if (width > 0) result.width = width;
+    if (height > 0) result.height = height;
+    result.source = "rendered_dom";
+    if (candidate?.element_kind) result.render_kind = candidate.element_kind;
 
     return result;
   }
@@ -4139,7 +4236,7 @@
     if (!state?.candidate) return false;
     if (state.status === "pending") return false;
     if (state.attempts >= options.maxImageAttempts) return false;
-    if (state.status === "exported" && state.quality !== "low") return false;
+    if (state.status === "exported") return false;
 
     const candidate = state.candidate;
     const hasSource = Boolean(candidate.source);
@@ -4161,6 +4258,10 @@
 
     while (guard < guardLimit) {
       guard += 1;
+
+      // Titik henti antar-gambar. Membuka media viewer memakan waktu, jadi STOP
+      // harus terasa langsung tanpa menunggu seluruh antrean selesai.
+      if (isStopRequested()) break;
 
       if (typeof collect === "function") {
         try { collect(); } catch (_error) {}
@@ -4230,6 +4331,21 @@
   }
 
   async function captureImageSmart({ chatName, messageId, candidate, main, scroller, options }) {
+    const database = options.mediaDatabase ||= { units: new Map(), files: new Map() };
+    const unitId = JSON.stringify([chatName, messageId]);
+    if (database.units.has(unitId)) return database.units.get(unitId);
+    // Catat promise sebelum I/O: pemanggilan bersamaan berbagi pekerjaan yang sama.
+    const pending = captureImageUnit({ chatName, messageId, candidate, main, scroller, options });
+    database.units.set(unitId, pending);
+    try {
+      return await pending;
+    } catch (error) {
+      database.units.delete(unitId); // Kegagalan tidak dianggap sudah diproses.
+      throw error;
+    }
+  }
+
+  async function captureImageUnit({ chatName, messageId, candidate, main, scroller, options }) {
     let previewResult = null;
     let viewerResult = null;
     let previewError = null;
@@ -4365,14 +4481,19 @@
 
   async function downloadImageCapture({ chatName, messageId, capture, options }) {
     const blob = capture.blob;
+    const database = options.mediaDatabase ||= { units: new Map(), files: new Map() };
+    const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+    const uniqueKey = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    if (database.files.has(uniqueKey)) return database.files.get(uniqueKey);
     const mimeType = normalizeImageMime(blob.type, capture.source_url || "");
     const extension = imageExtensionForMime(mimeType);
     const chatFolder = `${sanitizePathSegment(chatName).slice(0, 70)}-${simpleHash(chatName).slice(0, 6)}`;
-    const filename = `image-${simpleHash(messageId)}.${extension}`;
+    const filename = `image-${uniqueKey}.${extension}`;
     const relativePath = `img/${chatFolder}/${filename}`;
     const downloadPath = `${options.exportRoot}/${relativePath}`;
 
-    return {
+    const result = {
+      unique_key: uniqueKey,
       filename,
       relative_path: relativePath,
       download_path: downloadPath,
@@ -4384,11 +4505,47 @@
       height: capture.height || null,
       blob
     };
+    database.files.set(uniqueKey, result);
+    return result;
   }
 
   async function buildExportZipBundle({ exportRoot, payload, exportedChats = [] }) {
-    const jsonData = JSON.stringify(payload, null, 2);
-    const files = [{ path: `${exportRoot}/messages/export.json`, data: jsonData }];
+    // v0.9.3: satu kontak/grup = satu file JSON. Folder messages berisi tepat
+    // sebanyak chat yang berhasil di-scrape, bukan satu file gabungan.
+    const files = [];
+    const jsonFiles = [];
+    const usedFilenames = new Set();
+
+    for (const chat of exportedChats) {
+      if (!chat) continue;
+
+      const filename = buildChatJsonFilename(chat, usedFilenames);
+      const relativePath = `messages/${filename}`;
+      const chatPayload = buildChatJsonPayload({ payload, chat, relativePath });
+
+      files.push({
+        path: `${exportRoot}/${relativePath}`,
+        data: JSON.stringify(chatPayload, null, 2)
+      });
+      jsonFiles.push({
+        chat_id: chat.chat_id || null,
+        chat_name: chat.chat_name || null,
+        community_name: chat.community_name || null,
+        source_kind: chat.source_kind || "chat",
+        filename,
+        relative_path: relativePath,
+        message_count: Number(chat.message_count || 0)
+      });
+    }
+
+    // Ringkasan gabungan tetap tersedia, tetapi disimpan di akar arsip agar
+    // folder messages hanya memuat file per chat.
+    files.push({
+      path: `${exportRoot}/export-summary.json`,
+      data: JSON.stringify(buildExportSummaryJson({ payload, jsonFiles }), null, 2)
+    });
+
+    const includedPaths = new Set();
 
     for (const chat of exportedChats) {
       const imageFiles = Array.isArray(chat?.image_files) ? chat.image_files : [];
@@ -4398,11 +4555,68 @@
 
         const relative = String(image.relative_path || "").replace(/^\.+\//, "");
         const zipPath = `${exportRoot}/${relative}`;
+        if (includedPaths.has(zipPath)) continue;
+        includedPaths.add(zipPath);
         files.push({ path: zipPath, data: blob });
       }
     }
 
-    return createZipBlob(files);
+    return { blob: await createZipBlob(files), jsonFiles };
+  }
+
+  function buildChatJsonFilename(chat, usedFilenames = new Set()) {
+    // Nama file memakai konvensi yang sama dengan folder img/: nama chat yang
+    // sudah disanitasi plus hash pendek, sehingga dua chat dengan nama mirip
+    // (atau nama yang sama di Community berbeda) tidak saling menimpa.
+    const rawName = chat?.chat_name || chat?.chat_id || "chat";
+    const identity = [
+      chat?.chat_id || "",
+      chat?.chat_name || "",
+      chat?.community_name || ""
+    ].join("|");
+    const base = `${sanitizePathSegment(rawName).slice(0, 70)}-${simpleHash(identity).slice(0, 6)}`;
+
+    let filename = `${base}.json`;
+    let suffix = 2;
+    while (usedFilenames.has(filename)) {
+      filename = `${base}-${suffix}.json`;
+      suffix += 1;
+    }
+    usedFilenames.add(filename);
+
+    return filename;
+  }
+
+  function buildChatJsonPayload({ payload, chat, relativePath }) {
+    const { output, export_summary: _summary, errors: _errors, ...shared } = payload || {};
+
+    return {
+      ...shared,
+      output: {
+        ...(output || {}),
+        json_file: relativePath
+      },
+      chat: sanitizeChatForJson(chat)
+    };
+  }
+
+  function buildExportSummaryJson({ payload, jsonFiles = [] }) {
+    return {
+      ...(payload || {}),
+      chat_files: jsonFiles
+    };
+  }
+
+  function sanitizeChatForJson(chat) {
+    if (!chat || typeof chat !== "object") return chat;
+
+    // Blob gambar hanya dipakai untuk menyusun ZIP. JSON.stringify akan
+    // mengubahnya menjadi objek kosong, jadi buang dan simpan metadatanya saja.
+    const imageFiles = Array.isArray(chat.image_files)
+      ? chat.image_files.map(({ blob: _blob, ...metadata }) => metadata)
+      : chat.image_files;
+
+    return { ...chat, image_files: imageFiles };
   }
 
   async function createZipBlob(entries = []) {
@@ -5168,10 +5382,16 @@
   }
 
   function findMessageBubble(metadataNode) {
-    const dataIdAncestor = metadataNode.closest("[data-id]");
+    const nativeRoot = metadataNode.closest('[data-id^="true_"], [data-id^="false_"], [id^="true_"], [id^="false_"]');
+    if (nativeRoot) return nativeRoot;
+    const messageRoot = metadataNode.closest(".message-in, .message-out");
+    if (messageRoot) return messageRoot;
+    const dataIdAncestor = metadataNode.closest("[data-id], [id^='true_'], [id^='false_']");
     if (dataIdAncestor) {
       return dataIdAncestor;
     }
+    const row = metadataNode.closest('[role="row"]');
+    if (row) return row;
 
     let current = metadataNode;
 
@@ -5246,17 +5466,21 @@
     return toLocalIsoString(date);
   }
 
-  function extractMessageText(metadataNode, bubble) {
+  function extractMessageText(metadataNode, bubble, captionOnly = false) {
     const selectable = Array.from(
       bubble.querySelectorAll(".selectable-text")
     )
       .filter(isVisible)
+      .filter((element) => !isQuotedOrLinkPreview(element, bubble))
       .map((element) => cleanText(element.innerText))
       .filter(Boolean);
 
     if (selectable.length > 0) {
       return selectable.at(-1);
     }
+
+    // Jangan menjadikan durasi video atau jam pesan sebagai caption media.
+    if (captionOnly) return null;
 
     const nestedSelectable = Array.from(
       metadataNode.querySelectorAll("span[dir], div[dir]")
@@ -5289,70 +5513,50 @@
     return "unknown";
   }
 
-  function detectMedia(bubble, text) {
+  // Ruang lingkup ekspor hanya teks dan gambar. Fungsi ini menjawab satu
+  // pertanyaan: bubble ini gambar asli, permukaan yang harus dilewati, atau
+  // bukan media sama sekali.
+  //   - "image"   -> foto yang dikirim pengguna (dengan atau tanpa caption)
+  //   - "skip"    -> video/GIF/stiker/dokumen/voice note/link preview dll.
+  //   - null      -> bukan media; caption/teks diproses seperti pesan biasa
+  function detectMedia(bubble) {
     const labels = collectSemanticLabels(bubble).toLowerCase();
-    const filename = detectFilename(bubble, text);
-    const durationSeconds = detectDurationSeconds(bubble);
-    const imageElement = findBestMessageImage(bubble);
+    const imageElements = findMessageImages(bubble);
+    const imageElement = imageElements[0] || null;
 
-    let detectedAs = null;
+    // URUTAN PENTING: seluruh permukaan non-gambar diperiksa lebih dulu karena
+    // video, GIF, stiker, dan kartu dokumen juga memiliki <img> poster.
+    const isSkippable =
+      hasVideoSurface(bubble) ||
+      hasDocumentAttachment(bubble) ||
+      bubble.querySelector("audio") ||
+      /sticker|stiker/.test(labels) ||
+      /voice message|voice note|pesan suara/.test(labels) ||
+      /\bgif\b/.test(labels) ||
+      /document|dokumen|attachment|lampiran/.test(labels);
 
-    const documentSemantic = /document|dokumen|attachment|lampiran/.test(labels);
-
-    // PENTING: deteksi video/GIF HARUS mendahului deteksi gambar. Bubble video
-    // dan GIF juga memiliki elemen <img> (thumbnail/poster) sehingga tanpa
-    // guard ini thumbnail-nya keliru dianggap gambar dan ikut diekspor.
-    const hasVideoElement = Boolean(bubble.querySelector("video"));
-    const hasPlayIndicator = Boolean(
-      bubble.querySelector(
-        '[data-icon*="play"], [data-icon*="video"], [aria-label*="Play" i], [aria-label*="Putar" i], [aria-label*="video" i]'
-      )
-    );
-
-    if (/sticker|stiker/.test(labels)) {
-      detectedAs = "sticker";
-    } else if (/voice message|voice note|pesan suara/.test(labels)) {
-      detectedAs = "voice_note";
-    } else if (bubble.querySelector("audio")) {
-      detectedAs = "audio";
-    } else if (/\bgif\b/.test(labels)) {
-      detectedAs = "gif";
-    } else if (hasVideoElement || hasPlayIndicator) {
-      detectedAs = "video";
-    } else if (/location|lokasi|map|peta/.test(labels)) {
-      detectedAs = "location";
-    } else if (/contact card|kartu kontak|contact/.test(labels)) {
-      detectedAs = "contact";
-    } else if (/poll|jajak pendapat/.test(labels)) {
-      detectedAs = "poll";
-    } else if (documentSemantic) {
-      detectedAs = "document";
-    } else if (
-      imageElement ||
-      /photo|image|foto|gambar/.test(labels)
-    ) {
-      detectedAs = "image";
-    } else if (filename) {
-      detectedAs = "document";
+    if (isSkippable) {
+      return { detectedAs: "skip", imageElements: [] };
     }
 
-    if (!detectedAs) {
+    // findMessageImages() sudah membuang thumbnail di dalam kartu preview,
+    // sehingga sisa kandidat di sini adalah foto asli.
+    if (hasLinkPreview(bubble) && !imageElement) {
+      return { detectedAs: "skip", imageElements: [] };
+    }
+
+    if (!imageElement) {
       return null;
     }
 
-    return {
-      detectedAs,
-      filename,
-      durationSeconds,
-      imageElement: detectedAs === "image" ? imageElement : null,
-      imageElements: detectedAs === "image" ? findMessageImages(bubble) : []
-    };
+    return { detectedAs: "image", imageElement, imageElements };
   }
 
   function findMessageImages(bubble) {
     const candidates = [];
 
     for (const element of bubble.querySelectorAll("img, canvas")) {
+      if (isQuotedOrLinkPreview(element, bubble)) continue;
       const rectangle = element.getBoundingClientRect();
       if (rectangle.width < 64 || rectangle.height < 64) continue;
 
@@ -5361,7 +5565,11 @@
         element.getAttribute?.("aria-label"),
         element.getAttribute?.("title")
       ].map(cleanText).join(" ").toLowerCase();
+      // Avatar, ikon UI, dan thumbnail kartu dokumen/tautan tidak pernah
+      // merupakan foto yang dikirim pengguna.
       if (/avatar|profile photo|foto profil/.test(labels)) continue;
+      if (/thumbnail|thumb|preview|pratinjau|pratayang/.test(labels)) continue;
+      if (/document|dokumen|pdf|attachment|lampiran/.test(labels)) continue;
       candidates.push(element);
     }
 
@@ -5371,17 +5579,117 @@
     // background-asli tidak pernah terdeteksi -> gambar ter-skip. Sekarang
     // background-image SELALU ikut dikumpulkan sebagai kandidat tambahan.
     for (const element of bubble.querySelectorAll("div, span")) {
+      if (isQuotedOrLinkPreview(element, bubble)) continue;
       const rectangle = element.getBoundingClientRect();
       if (rectangle.width < 96 || rectangle.height < 96) continue;
       if (!extractBackgroundImageUrl(element)) continue;
       candidates.push(element);
     }
 
-    return candidates.sort((a, b) => imageArea(b) - imageArea(a));
+    // Urutan DOM stabil, tidak berubah saat resolusi salah satu tile meningkat.
+    // Hapus hanya representasi yang menempati tile yang sama, bukan foto lain
+    // yang kebetulan memakai URL/placeholder sama.
+    const unique = [];
+    for (const element of candidates) {
+      const rect = element.getBoundingClientRect();
+      const duplicate = unique.findIndex((other) => {
+        const otherRect = other.getBoundingClientRect();
+        // Placeholder/canvas dan img bisa berupa sibling yang saling menimpa.
+        return Math.abs(rect.left - otherRect.left) < 3 &&
+          Math.abs(rect.top - otherRect.top) < 3 &&
+          Math.abs(rect.width - otherRect.width) < 3 &&
+          Math.abs(rect.height - otherRect.height) < 3;
+      });
+      if (duplicate < 0) unique.push(element);
+      else if (imageArea(element) > imageArea(unique[duplicate])) unique[duplicate] = element;
+    }
+    return unique.sort((a, b) => {
+      const position = a.compareDocumentPosition(b);
+      return position & 4 ? -1 : position & 2 ? 1 : 0;
+    });
   }
 
-  function findBestMessageImage(bubble) {
-    return findMessageImages(bubble)[0] || null;
+  function isQuotedOrLinkPreview(element, bubble) {
+    // WhatsApp Web modern sudah banyak membuang data-testid. Selain atribut
+    // lama, periksa juga pembungkus <a href>, blockquote, penanda kelas/aria
+    // quoted, dan kartu preview agar thumbnail balasan maupun thumbnail tautan
+    // tidak pernah masuk antrean ekspor gambar.
+    const container = element.closest(
+      '[data-testid*="quoted"], [data-testid*="link-preview"], [data-testid*="url-preview"], ' +
+      '[class*="quoted-mention"], [class*="quoted"], blockquote, ' +
+      '[class*="link-preview"], [class*="url-preview"], ' +
+      '[aria-label*="Quoted" i], [aria-label*="Dikutip" i], [aria-label*="Balasan" i], ' +
+      'a[href^="http://"], a[href^="https://"]'
+    );
+    return Boolean(container && bubble.contains(container));
+  }
+
+  function extractMessageUrls(bubble) {
+    return [...new Set(Array.from(bubble.querySelectorAll('a[href]'))
+      .filter((element) => !element.closest('[data-testid*="quoted"]'))
+      .map((element) => element.getAttribute("href"))
+      .filter((url) => /^https?:\/\//i.test(url || "")))];
+  }
+
+  function hasLinkPreview(bubble) {
+    if (!extractMessageUrls(bubble).length) return false;
+    // Selain data-testid lama, kenali kartu preview lewat penanda kelas dan
+    // pembungkus <a> yang memuat gambar/background.
+    return Boolean(bubble.querySelector(
+      '[data-testid*="link-preview"], [data-testid*="url-preview"], ' +
+      '[class*="link-preview"], [class*="url-preview"]'
+    )) ||
+      Array.from(bubble.querySelectorAll('a[href]')).some((link) =>
+        /^https?:\/\//i.test(link.getAttribute("href") || "") &&
+        (link.querySelector("img, canvas") || extractBackgroundImageUrl(link))
+      );
+  }
+
+  // Kartu dokumen (PDF/Office/arsip) sering merender preview halaman pertama
+  // sebagai <img>/canvas berukuran besar. Tanpa guard ini preview tersebut
+  // lolos sebagai foto biasa dan ikut terekspor. Deteksi memakai tiga sinyal
+  // independen: atribut unduhan, ikon dokumen, dan pola teks kartu dokumen.
+  function hasDocumentAttachment(bubble) {
+    if (!bubble?.querySelector) return false;
+
+    if (
+      bubble.querySelector(
+        '[download], [data-icon*="document"], [data-icon*="pdf"], ' +
+        '[data-icon*="doc"], [data-icon*="sheet"], [data-icon*="slide"], ' +
+        '[aria-label*="Download" i], [aria-label*="Unduh" i]'
+      )
+    ) {
+      return true;
+    }
+
+    const labels = collectSemanticLabels(bubble).toLowerCase();
+    const body = cleanText(bubble.innerText).toLowerCase();
+    const haystack = `${labels} ${body}`;
+
+    // Ekstensi berkas non-gambar yang WhatsApp tampilkan sebagai kartu dokumen.
+    if (/\.(pdf|docx?|xlsx?|pptx?|txt|csv|zip|rar|7z|apk|odt|ods|odp)\b/.test(haystack)) {
+      return true;
+    }
+
+    // Kartu dokumen menampilkan jumlah halaman dan/atau ukuran berkas.
+    const hasPageCount = /\b\d+\s*(pages?|halaman)\b/.test(haystack);
+    const hasFileSize = /\b\d+(?:[.,]\d+)?\s*[kmg]b\b/.test(haystack);
+    return hasPageCount || hasFileSize;
+  }
+
+  // Video/GIF juga memiliki <img> poster. Selain elemen <video>, kenali tombol
+  // putar, label durasi, dan penanda GIF supaya poster tidak dianggap foto.
+  function hasVideoSurface(bubble) {
+    if (!bubble?.querySelector) return false;
+
+    if (bubble.querySelector("video")) return true;
+
+    return Boolean(
+      bubble.querySelector(
+        '[data-icon*="play"], [data-icon*="video"], [data-icon*="gif"], ' +
+        '[aria-label*="Play" i], [aria-label*="Putar" i], [aria-label*="video" i]'
+      )
+    );
   }
 
   function imageArea(image) {
@@ -5399,31 +5707,15 @@
     return width * height;
   }
 
-  function detectMessageType(text, media, bubble) {
-    const normalizedText = (text || "").toLowerCase();
-    const labels = collectSemanticLabels(bubble).toLowerCase();
-
-    if (
-      /this message was deleted|pesan ini telah dihapus|you deleted this message|anda menghapus pesan ini/.test(
-        `${normalizedText} ${labels}`
-      )
-    ) {
-      return "deleted";
-    }
-
+  // Hanya dua tipe yang diekspor: "img" dan "text". null berarti bubble tidak
+  // menghasilkan apa pun dan harus dilewati oleh pemanggil.
+  function detectMessageType(text, media) {
     if (media?.detectedAs === "image") {
       return "img";
     }
 
-    if (media?.detectedAs) {
-      return media.detectedAs;
-    }
-
-    if (text) {
-      return "text";
-    }
-
-    return "unknown";
+    // Media non-gambar hanya menyumbang caption teks aslinya, bila ada.
+    return text ? "text" : null;
   }
 
   function collectSemanticLabels(root) {
@@ -5440,47 +5732,6 @@
     }
 
     return values.join(" ");
-  }
-
-  function detectFilename(bubble, text) {
-    const candidates = [
-      ...Array.from(bubble.querySelectorAll("[download]"), (element) =>
-        element.getAttribute("download")
-      ),
-      ...Array.from(bubble.querySelectorAll("[title]"), (element) =>
-        element.getAttribute("title")
-      ),
-      text
-    ]
-      .map(cleanText)
-      .filter(Boolean);
-
-    const filenamePattern = /[^\\/:*?"<>|\n]+\.[a-z0-9]{2,8}(?:\b|$)/i;
-
-    for (const candidate of candidates) {
-      const match = candidate.match(filenamePattern);
-      if (match) {
-        return match[0];
-      }
-    }
-
-    return null;
-  }
-
-  function detectDurationSeconds(bubble) {
-    const text = cleanText(bubble.innerText);
-    const matches = Array.from(text.matchAll(/\b(\d{1,2}):(\d{2})\b/g));
-
-    for (const match of matches) {
-      const minutes = Number(match[1]);
-      const seconds = Number(match[2]);
-
-      if (seconds < 60) {
-        return minutes * 60 + seconds;
-      }
-    }
-
-    return null;
   }
 
   function extractReplyPreview(bubble, messageText, currentMessageId = null) {
@@ -5690,6 +5941,10 @@
       id = candidate ? candidate.getAttribute("id") : null;
     }
 
+    if (!id) {
+      candidate = bubble.querySelector('[data-id^="true_"], [data-id^="false_"], [id^="true_"], [id^="false_"]');
+      id = candidate?.getAttribute("data-id") || candidate?.getAttribute("id");
+    }
     return cleanText(id) || null;
   }
 
