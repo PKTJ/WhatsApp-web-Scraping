@@ -10,7 +10,7 @@
   <main class="app">
     <header class="hero">
       <div class="hero-topline">
-        <span class="version-badge">v0.9.2</span>
+        <span class="version-badge">v0.9.3</span>
         <span class="local-badge">Pemrosesan lokal</span>
       </div>
       <h1>WhatsApp JSON + Image Exporter</h1>
@@ -82,6 +82,27 @@
         <button id="selectAllButton" type="button" class="secondary compact" disabled>Pilih semua</button>
       </div>
 
+      <div class="contact-tools">
+        <div class="contact-file-row">
+          <label class="file-button secondary compact" for="contactFile">Muat daftar CSV / Excel</label>
+          <input id="contactFile" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
+          <button id="invertCheckButton" type="button" class="secondary compact" disabled>Balik ceklis</button>
+        </div>
+        <label class="field contact-match-field" for="contactMatchMode">
+          <span>Pencocokan nama saat unggah</span>
+          <select id="contactMatchMode" aria-describedby="contactMatchHelp">
+            <option value="smart">Cerdas — nama mirip / kata kunci</option>
+            <option value="exact">Persis — nama / ID sama</option>
+          </select>
+        </label>
+        <small id="contactMatchHelp">Mode cerdas mengabaikan kapital, aksen, dan tanda baca; mengenali kata kunci utuh dan salah ketik ringan. Kandidat ambigu perlu dipilih manual. Perubahan mode diterapkan saat unggah atau pindai berikutnya.</small>
+        <small id="contactFileStatus" role="status">Unggah CSV / Excel berisi nama kontak, grup, atau kata kunci untuk otomatis menceklis chat yang cocok.</small>
+        <details id="contactMatchDetails" class="contact-match-details" hidden>
+          <summary>Rincian pencocokan</summary>
+          <div id="contactMatchResults" class="contact-match-results"></div>
+        </details>
+      </div>
+
       <div class="selection-bar">
         <span id="selectionMeta">0 dipilih · 0 chat</span>
       </div>
@@ -128,6 +149,7 @@
     </div>
   </main>
 
+  <script src="contact-list.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

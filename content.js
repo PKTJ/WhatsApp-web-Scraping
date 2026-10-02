@@ -2175,12 +2175,18 @@
   function publicChatEntry(entry) {
     return {
       id: entry.id,
+      contact_id: extractNumericContactId(entry.identity_key),
       name: entry.name,
       preview: entry.preview || "",
       community_name: entry.community_name || null,
       source_kind: entry.source_kind || "chat",
       membership_status: entry.membership_status || null
     };
+  }
+
+  function extractNumericContactId(identityKey) {
+    const match = /(?:data-jid|data-chat-id|data-id):\+?(\d{6,20})(?:@(?:c\.us|s\.whatsapp\.net))?/i.exec(String(identityKey || ""));
+    return match ? match[1] : null;
   }
 
   function compareScannedEntries(a, b) {
@@ -2371,6 +2377,7 @@
         json_file_mode: "one_file_per_chat",
         json_file_naming: "messages/<nama chat>-<hash nama>.json",
         summary_file: "export-summary.json",
+        contacts_file: "exported-contacts.csv",
         media_directory: options.exportImages ? "img" : null
       },
       export_settings: {
@@ -2430,7 +2437,7 @@
         "Selector DOM WhatsApp Web dapat berubah dan mungkin memerlukan pembaruan ekstensi.",
         "Urutan pesan diprioritaskan berdasarkan posisi visual dari atas ke bawah pada DOM WhatsApp Web; timestamp digunakan sebagai fallback.",
         "Chat yang gagal ditemukan atau gagal dibuka tetap tercatat di export_summary.per_chat dengan status error dan tetap dihitung pada attempted_chat_count.",
-        "Setiap kontak/grup disimpan sebagai satu file JSON terpisah di folder messages/. Ringkasan seluruh chat, daftar error, dan indeks file berada di export-summary.json pada akar arsip."
+        "Setiap kontak/grup disimpan sebagai satu file JSON terpisah di folder messages/. Ringkasan seluruh chat, daftar error, indeks file, dan exported-contacts.csv berada di akar arsip."
       ].filter(Boolean),
       errors,
       // chats sengaja TIDAK disertakan di sini. Payload ini dipakai sebagai
@@ -2481,6 +2488,7 @@
       outputDirectory: exportRoot,
       // Jumlah file JSON per chat yang benar-benar masuk ke folder messages.
       jsonFiles: jsonFiles.length,
+      contactsFile: `${exportRoot}/exported-contacts.csv`,
       jsonFilePaths: jsonFiles.map((file) => file.relative_path),
       errors,
       chatResults
@@ -2504,6 +2512,7 @@
 
     return {
       chat_id: chat.chat_id || null,
+      contact_id: chat.contact_id || null,
       chat_name: chat.chat_name,
       source_kind: chat.source_kind || "chat",
       community_name: chat.community_name || null,
@@ -3505,7 +3514,8 @@
 
         scrollStepsUsed += 1;
         const countBefore = collector.size;
-        triggerOlderMessagesLoad(scroller, main);
+        const clickedOlder = clickOlderMessagesButton(main);
+        if (!clickedOlder) triggerOlderMessagesLoad(scroller, main);
 
         const waitResult = await waitForOlderMessageProgress({
           main,
@@ -3517,6 +3527,7 @@
         });
 
         totalWaitMs += waitResult.waitedMs;
+        if (waitResult.scroller?.isConnected) scroller = waitResult.scroller;
 
         if (waitResult.progress) {
           successfulLoadBatches += 1;
@@ -3627,6 +3638,7 @@
 
     return {
       chat_id: entry.id,
+      contact_id: extractNumericContactId(entry.identity_key),
       chat_name: entry.name,
       chat_type: inferChatType(main),
       source_kind: entry.source_kind || "chat",
@@ -3710,6 +3722,20 @@
     }
   }
 
+  function clickOlderMessagesButton(main) {
+    // Hanya tombol aksi pemuatan, bukan teks pesan yang kebetulan serupa.
+    for (const button of main?.querySelectorAll?.('button, [role="button"]') || []) {
+      if (!isVisible(button)) continue;
+      const labels = [button.getAttribute?.("aria-label"), button.getAttribute?.("title"), button.textContent]
+        .map((value) => String(value || "").trim().replace(/\s+/g, " "));
+      if (labels.some((value) => /^(?:muat|tampilkan|lihat|load|show|view) (?:lebih banyak )?(?:pesan|messages?) (?:lama|sebelumnya|older|previous|earlier)(?: lagi)?$/i.test(value))) {
+        button.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function waitForOlderMessageProgress({
     main,
     scroller,
@@ -3723,8 +3749,12 @@
     let previousHeight = activeScroller.scrollHeight;
     let previousTop = activeScroller.scrollTop;
     let lastDomMovementAt = startedAt;
+    let lastNudgeAt = startedAt;
+    let loadingSince = null;
+    let extraWaitMs = 0;
 
-    while (Date.now() - startedAt < maxWaitMs) {
+    while (Date.now() - startedAt < maxWaitMs + extraWaitMs) {
+      if (isStopRequested()) break;
       await sleep(280);
 
       if (!activeScroller.isConnected) {
@@ -3733,7 +3763,8 @@
           return {
             progress: false,
             waitedMs: Date.now() - startedAt,
-            scrollerLost: true
+            scrollerLost: true,
+            scroller: null
           };
         }
       }
@@ -3744,7 +3775,8 @@
         return {
           progress: true,
           waitedMs: Date.now() - startedAt,
-          scrollerLost: false
+          scrollerLost: false,
+          scroller: activeScroller
         };
       }
 
@@ -3763,13 +3795,20 @@
       // Jika WhatsApp masih menampilkan indikator pemuatan atau struktur scroll
       // masih berubah, tunggu sampai batas maksimum alih-alih menganggap gagal.
       const loading = isOlderMessagesLoading(main);
+      if (loading) {
+        if (loadingSince === null) loadingSince = Date.now();
+        // Beri waktu tambahan bila indikator pemuatan nyata terlihat, terbatas.
+        if (Date.now() - loadingSince >= 600) extraWaitMs = Math.min(20_000, maxWaitMs);
+      } else loadingSince = null;
       const stableForMs = Date.now() - lastDomMovementAt;
 
       // Saat tidak berada di dekat atas dan tidak ada perubahan sama sekali,
       // lakukan dorongan tambahan supaya virtual list terus bergerak ke atas.
-      if (!loading && stableForMs >= 1_500 && activeScroller.scrollTop > 80) {
-        triggerOlderMessagesLoad(activeScroller);
-        lastDomMovementAt = Date.now();
+      if (!loading && stableForMs >= 900 && Date.now() - lastNudgeAt >= 1_200) {
+        if (!clickOlderMessagesButton(main) && activeScroller.scrollTop > 0) {
+          triggerOlderMessagesLoad(activeScroller, main);
+        }
+        lastNudgeAt = Date.now();
       }
     }
 
@@ -3778,7 +3817,8 @@
     return {
       progress: getCollectedCount() > countBefore,
       waitedMs: Date.now() - startedAt,
-      scrollerLost: false
+      scrollerLost: false,
+      scroller: activeScroller
     };
   }
 
@@ -4543,6 +4583,14 @@
     files.push({
       path: `${exportRoot}/export-summary.json`,
       data: JSON.stringify(buildExportSummaryJson({ payload, jsonFiles }), null, 2)
+    });
+
+    // Daftar ini sengaja hanya memuat chat yang berhasil dibaca dan dimasukkan
+    // ke arsip. File tersebut dapat diunggah ke ekspor berikutnya untuk mengunci
+    // ulang pilihan berdasarkan nama persis atau ID angka.
+    files.push({
+      path: `${exportRoot}/exported-contacts.csv`,
+      data: ContactList.buildExportedContactsCsv(exportedChats)
     });
 
     const includedPaths = new Set();
@@ -5476,24 +5524,143 @@
       .filter(Boolean);
 
     if (selectable.length > 0) {
-      return selectable.at(-1);
+      // WhatsApp Web modern merender SATU pesan panjang sebagai beberapa blok
+      // .selectable-text (header laporan, isi, penutup). Sebelumnya hanya blok
+      // TERAKHIR yang diambil sehingga potongan awal pesan hilang dan dianggap
+      // quoted reply palsu oleh extractReplyPreview(). Gabungkan seluruh blok
+      // milik pesan ini (urutan DOM) menjadi satu teks utuh. Blok yang berada
+      // di dalam kontainer quote/preview sudah disaring di atas.
+      const seen = new Set();
+      return selectable
+        .filter((text) => {
+          const key = normalizeComparable(text);
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .join("\n");
     }
 
     // Jangan menjadikan durasi video atau jam pesan sebagai caption media.
     if (captionOnly) return null;
 
+    // Fallback bila tidak ada .selectable-text: hindari menjadikan jam pesan
+    // atau nama pengirim sebagai teks. Ambil blok paling informatif (terpanjang)
+    // yang bukan sekadar jam/tanggal/nama, bukan sekadar blok terakhir.
     const nestedSelectable = Array.from(
       metadataNode.querySelectorAll("span[dir], div[dir]")
     )
       .filter(isVisible)
       .map((element) => cleanText(element.innerText))
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter((text) => !isLikelyTimestampOrNameOnly(text));
 
     if (nestedSelectable.length > 0) {
-      return nestedSelectable.at(-1);
+      return nestedSelectable.reduce((best, text) =>
+        text.length > best.length ? text : best, "");
     }
 
     return null;
+  }
+
+  function isLikelyTimestampOrNameOnly(text) {
+    const value = cleanText(text);
+    if (!value) return true;
+    // Jam saja: "14.23", "09:20", "2.05 PM", dst.
+    if (/^\d{1,2}[:.]\d{2}(?:\s*(?:am|pm|AM|PM))?$/.test(value)) return true;
+    // Tanggal/jam metadata umum, bukan isi pesan.
+    if (/^\d{1,2}[:.]\d{2}\s*[,/-]/.test(value)) return true;
+    return false;
+  }
+
+  // Stempel visual di dalam SATU pesan yang tidak pernah menjadi isi quote:
+  // pemisah dekoratif (====, ----, ****), jam/tanggal, label status pengiriman
+  // (Dikirim/Delivered/Read/Sent — sering bocor dari aria-label ikon centang),
+  // kata UI generik, dan label tanggal hari.
+  function isQuoteStamp(value) {
+    const key = cleanText(value)
+      .toLocaleLowerCase()
+      .replace(/[​‌‍﻿‎‏]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!key) return true;
+    // Pemisah dekoratif: "=====", "------", "******", "_____", dsb.
+    if (/^[-=*_.~•·—–]{3,}$/.test(key)) return true;
+    // Jam / jam+tanggal.
+    if (/^\d{1,2}[:.]\d{2}(?:\s*(?:am|pm|AM|PM))?(?:\s*[,/|-].*)?$/.test(key)) return true;
+    // Status pengiriman dan kata UI (inline agar fungsi ini mandiri saat
+    // diekstraksi apa adanya oleh harness unit test).
+    const words = new Set([
+      "dikirim", "delivered", "sent", "read", "dibaca", "diterima", "pending",
+      "terkirim", "sending", "mengirim",
+      "you", "anda", "reply", "replied", "balas", "dibalas", "meneruskan",
+      "forwarded", "diteruskan", "photo", "foto", "video", "sticker", "stiker",
+      "dokumen", "document", "audio", "gif", "kontak", "contact"
+    ]);
+    if (words.has(key)) return true;
+    // Label hari/tanggal header.
+    if (/^(today|yesterday|hari ini|kemarin)$/i.test(key)) return true;
+    if (/^(senin|selasa|rabu|kamis|jumat|sabtu|minggu|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(key)) return true;
+    return false;
+  }
+
+  // Elemen yang boleh membuktikan sebuah kontainer adalah KARTU QUOTE: teks
+  // pesan nyata (selectable), gambar/video, atau lampiran — BUKAN teks polos
+  // lain, supaya bubble pesan panjang yang memuat banyak <span>/<div> biasa
+  // tidak memenuhi syarat secara tidak sengaja.
+  function quoteEvidenceSelector() {
+    return ".selectable-text, span[dir], img, video, canvas, " +
+      "[data-icon], [aria-label], [title], a[href]";
+  }
+
+  function quoteContainerEvidenceScore(container) {
+    let score = 0;
+    let elements = [];
+    try {
+      elements = Array.from(container.querySelectorAll(quoteEvidenceSelector()));
+    } catch (_error) {
+      return 0;
+    }
+
+    for (const element of elements) {
+      let tag = "";
+      try {
+        tag = String(element.tagName || "").toUpperCase();
+      } catch (_error) {
+        tag = "";
+      }
+      if (tag === "IMG" || tag === "VIDEO" || tag === "CANVAS") {
+        score += 1;
+        continue;
+      }
+
+      let text = "";
+      try {
+        text = cleanText(element.innerText || element.textContent || "");
+      } catch (_error) {
+        text = "";
+      }
+      if (!text) continue;
+
+      // Teks pesan nyata (2+ baris) = bukti kuat bahwa ini kartu quote.
+      if (text.includes("\n") && text.length > 24) return 10;
+      // Stempel visual = bukti PENDUKUNG, bukan bukti utama.
+      if (isQuoteStamp(text)) score += 0.5;
+      // Baris teks tunggal bermakna (preview quote) = bukti.
+      else score += 1;
+    }
+
+    return score;
+  }
+
+  // Apakah elemen ini benar-benar KARTU QUOTE (struktural), bukan sekadar
+  // elemen kebetulan memiliki class mengandung kata "quoted" (CSS-in-JS hash /
+  // komponen UI lain)? Kartu quote nyata memuat SETIDAKNYA SATU bukti bermakna
+  // (preview teks / gambar / video / stempel); elemen nyasar yang kosong atau
+  // hanya berisi elemen UI tanpa isi tidak lolos.
+  function isRealQuoteContainer(element) {
+    if (!element?.querySelectorAll) return false;
+    return quoteContainerEvidenceScore(element) >= 1;
   }
 
   function detectDirection(bubble) {
@@ -5614,14 +5781,32 @@
     // lama, periksa juga pembungkus <a href>, blockquote, penanda kelas/aria
     // quoted, dan kartu preview agar thumbnail balasan maupun thumbnail tautan
     // tidak pernah masuk antrean ekspor gambar.
-    const container = element.closest(
-      '[data-testid*="quoted"], [data-testid*="link-preview"], [data-testid*="url-preview"], ' +
-      '[class*="quoted-mention"], [class*="quoted"], blockquote, ' +
+    //
+    // CATATAN: bubble pesan panjang bisa memiliki class yang KEBETULAN
+    // mengandung kata "quoted" (CSS-in-JS hash / komponen UI lain). Mempercayai
+    // substring class apa pun akan menghapus teks pesan dan/atau menghasilkan
+    // reply palsu. Karena itu penanda dibagi dua tingkat:
+    //   - KETAT: blockquote / data-testid / aria-label balasan / link preview
+    //     langsung dipercaya.
+    //   - KELAS "quoted": hanya dipercaya jika kontainernya lolos validasi
+    //     struktural sebagai kartu quote (memuat teks/media/stempel nyata).
+    const strictContainer = element.closest(
+      'blockquote, [data-testid*="quoted"], ' +
       '[class*="link-preview"], [class*="url-preview"], ' +
-      '[aria-label*="Quoted" i], [aria-label*="Dikutip" i], [aria-label*="Balasan" i], ' +
+      '[aria-label*="Quoted" i], [aria-label*="Dikutip" i], ' +
+      '[aria-label*="Balasan" i], [aria-label*="Membalas" i], [aria-label*="Replying" i], ' +
       'a[href^="http://"], a[href^="https://"]'
     );
-    return Boolean(container && bubble.contains(container));
+    if (strictContainer && bubble.contains(strictContainer)) {
+      return true;
+    }
+
+    const quotedContainer = element.closest('[class*="quoted"], [class*="quoted-mention"]');
+    if (quotedContainer && bubble.contains(quotedContainer)) {
+      return isRealQuoteContainer(quotedContainer);
+    }
+
+    return false;
   }
 
   function extractMessageUrls(bubble) {
@@ -5736,14 +5921,20 @@
 
   function extractReplyPreview(bubble, messageText, currentMessageId = null) {
     const messageKey = normalizeComparable(messageText || "");
-    const selectable = Array.from(bubble.querySelectorAll(".selectable-text"))
+    // Quoted reply HANYA boleh berasal dari elemen yang terkonfirmasi berada di
+    // dalam kontainer quote/balasan (penanda quoted-*, blockquote, atau label
+    // Dikutip/Balasan/Reply). Pendekatan lama menganggap SETIAP blok teks lain
+    // di dalam bubble sebagai quote; akibatnya pesan panjang yang dirender
+    // sebagai beberapa blok dipecah dan blok awalnya disalahartikan sebagai
+    // reply terhadap pesan itu sendiri (sender/message_id/sequence = null).
+    const quotedElements = Array.from(bubble.querySelectorAll(".selectable-text"))
       .filter(isVisible)
-      .map((element) => cleanText(element.innerText))
-      .filter(Boolean);
+      .filter((element) => isQuotedOrLinkPreview(element, bubble));
 
     const candidates = [];
     const seen = new Set();
-    for (const text of selectable) {
+    for (const element of quotedElements) {
+      const text = cleanText(element.innerText);
       const key = normalizeComparable(text);
       if (!key || key === messageKey || seen.has(key)) continue;
       seen.add(key);
@@ -5754,11 +5945,9 @@
       return null;
     }
 
-    // Quoted preview biasanya muncul sebelum body pesan aktual. Hindari memilih
-    // string sangat pendek yang lebih mungkin nama sender/label UI apabila ada
-    // kandidat lain yang lebih informatif.
-    const preview =
-      candidates.find((candidate) => candidate.length >= 2) || candidates[0];
+    // Gabungkan seluruh blok quote (urutan DOM) agar isi pesan yang dibalas
+    // tidak terpotong sama seperti perbaikan pada body pesan.
+    const preview = candidates.join("\n");
     if (!preview) return null;
 
     const sender = extractReplySender(bubble, preview, messageText);
@@ -5785,20 +5974,35 @@
       const match = label.match(/(?:replying to|reply to|membalas|balas ke)\s+(.+)/i);
       if (match?.[1]) {
         const value = cleanText(match[1]).replace(/[,:].*$/, "");
-        if (value) return value.slice(0, 160);
+        if (value && !isQuoteStamp(value)) return value.slice(0, 160);
       }
     }
 
+    // Fallback: WhatsApp menampilkan nama pengirim yang dikutip tepat di dalam
+    // kartu quote sebagai elemen teks kecil sebelum preview. Ambil kandidat itu
+    // dari kontainer quote saja, dan pastikan bukan potongan preview/teks pesan
+    // maupun label status pengiriman (mis. "Dikirim" dari ikon centang) atau
+    // stempel waktu/pemisah.
     const excluded = new Set([
       normalizeComparable(preview || ""),
       normalizeComparable(messageText || "")
     ]);
-    const titleCandidate = labels.find((label) => {
-      const key = normalizeComparable(label);
-      return key && !excluded.has(key) && label.length <= 160 && !isLikelySidebarMetadata(label);
-    });
+    const quoteContainer = Array.from(
+      bubble.querySelectorAll('[class*="quoted"], blockquote, [data-testid*="quoted"]')
+    ).find(isRealQuoteContainer) || null;
+    const scope = quoteContainer || bubble;
+    const nameCandidate = Array.from(scope.querySelectorAll("span, div"))
+      .filter(isVisible)
+      .map((element) => cleanText(element.innerText))
+      .filter((text) => {
+        const key = normalizeComparable(text);
+        return key && key.length >= 2 && key.length <= 60 && !excluded.has(key) &&
+          !isLikelyTimestampOrNameOnly(text) && !isLikelySidebarMetadata(text) &&
+          !isQuoteStamp(text);
+      })
+      .find((text) => /[\p{L}]/u.test(text) && text.length <= 60);
 
-    return titleCandidate || null;
+    return nameCandidate || null;
   }
 
   function extractQuotedMessageId(bubble, currentMessageId) {
@@ -5825,6 +6029,18 @@
         target = findReplyTargetByPreview(messages, index, reply);
       }
 
+      // Validasi silang: jika tidak ada message_id DOM DAN tidak ada pesan
+      // sebelumnya yang cocok dengan preview, kandidat reply ini hampir pasti
+      // FALSE-POSITIVE (mis. potongan pesan panjang yang salah diklasifikasikan
+      // sebagai quote). Buang seluruhnya agar tidak menghasilkan entri reply
+      // palsu dengan sender/message_id/sequence null — persis bug "pesan dianggap
+      // reply terhadap dirinya sendiri".
+      if (!target && !reply.message_id) {
+        return { ...message, reply_to: null };
+      }
+
+      // Target nyata ditemukan -> cantumkan sequence ASLI pesan tersebut.
+      // (Mis. pesan sequence 9 me-reply pesan sequence 4 -> sequence = 4.)
       return {
         ...message,
         reply_to: {
