@@ -61,8 +61,56 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return undefined;
   }
 
+  if (message?.type === "TRUSTED_CLICK") {
+    trustedClick(message.x, message.y)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+    return true;
+  }
+
   return undefined;
 });
+
+async function trustedClick(x, y) {
+  const [tab] = await chrome.tabs.query({ url: "https://web.whatsapp.com/*" });
+  if (!tab?.id) {
+    return { ok: false, error: "Tab WhatsApp Web aktif tidak ditemukan." };
+  }
+
+  const clientX = Math.round(Number(x));
+  const clientY = Math.round(Number(y));
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+    return { ok: false, error: "Koordinat klik tidak valid." };
+  }
+
+  const target = { tabId: tab.id };
+  await chrome.debugger.attach(target, "1.3");
+  try {
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: clientX,
+      y: clientY,
+      button: "none"
+    });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: clientX,
+      y: clientY,
+      button: "left",
+      clickCount: 1
+    });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: clientX,
+      y: clientY,
+      button: "left",
+      clickCount: 1
+    });
+    return { ok: true };
+  } finally {
+    await chrome.debugger.detach(target).catch(() => {});
+  }
+}
 
 async function saveSessionState(state) {
   try {

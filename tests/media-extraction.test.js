@@ -8,15 +8,22 @@ const ContactList = require('../contact-list.js');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 class Element {
-  constructor(order = 0, parent = null) {
+  constructor(order = 0, parent = null, tagName = 'DIV') {
     this.order = order;
     this.parent = parent;
     this.rect = { left: order * 100, top: 0, width: 100, height: 100 };
     this.attrs = {};
     this.background = 'none';
-    // Default agar scoring kartu quote bisa membaca struktur tanpa error.
-    this.tagName = 'DIV';
+    this.tagName = tagName;
     this.textContent = '';
+    this.childNodes = [];
+    this.nodeType = 1;
+  }
+  get children() { return this.childNodes.filter((child) => child.nodeType !== 3); }
+  appendChild(child) {
+    child.parent = this;
+    this.childNodes.push(child);
+    return child;
   }
   getAttribute(key) { return this.attrs[key] || null; }
   getBoundingClientRect() { return this.rect; }
@@ -36,6 +43,30 @@ class Element {
   }
   compareDocumentPosition(other) { return other.order > this.order ? 4 : 2; }
   querySelectorAll(selector) {
+    if (this.childNodes?.length && !this.nodes) {
+      const wanted = String(selector);
+      const hits = [];
+      const visit = (node) => {
+        for (const child of node.childNodes || []) {
+          const className = `${child.className || ''} ${child.attrs?.class || ''}`;
+          const matches = wanted.split(',').some((part) => {
+            const token = part.trim();
+            if (token === '.selectable-text') return className.includes('selectable-text');
+            if (token === '.copyable-text') return className.includes('copyable-text');
+            if (token.includes('data-lexical-text')) return child.attrs?.['data-lexical-text'] === 'true';
+            if (token === 'span[dir]' || token === 'div[dir]') {
+              const tag = String(child.tagName || '').toLowerCase();
+              return (tag === 'span' || tag === 'div') && child.attrs?.dir != null;
+            }
+            return false;
+          });
+          if (matches) hits.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      if (hits.length || wanted.includes('selectable-text') || wanted.includes('copyable-text')) return hits;
+    }
     if (this.nodes?.[selector]) return this.nodes[selector];
     // Selector komposit (".selectable-text, span[dir], img"): cocokkan SETIAP
     // bagian yang dipisah koma terhadap kunci yang terdaftar, lalu gabungkan —
@@ -94,14 +125,12 @@ class Element {
 }
 class Image extends Element {
   constructor(order = 0, parent = null) {
-    super(order, parent);
-    this.tagName = 'IMG';
+    super(order, parent, 'IMG');
   }
 }
 class Canvas extends Element {
   constructor(order = 0, parent = null) {
-    super(order, parent);
-    this.tagName = 'CANVAS';
+    super(order, parent, 'CANVAS');
   }
 }
 function setup(extraNames = []) {
@@ -120,7 +149,11 @@ function setup(extraNames = []) {
       root?.attrs?.['aria-label'], root?.attrs?.title, root?.attrs?.alt
     ].filter(Boolean).join(' '),
     findMessageBubble: (node) => node,
-    parsePrePlainText: () => ({ sender: 'A' }), detectDirection: () => 'incoming',
+    parsePrePlainText: () => ({
+      sender: 'A',
+      timestampRaw: '10:00, 01/04/2026',
+      timestampIso: '2026-04-01T10:00:00'
+    }), detectDirection: () => 'incoming',
     extractNativeMessageId: () => 'message-1', simpleHash: () => 'hash',
     // Stub: penanda metadata sidebar tidak relevan untuk skenario unit test.
     isLikelySidebarMetadata: () => false,
@@ -132,6 +165,9 @@ function setup(extraNames = []) {
     'detectMedia', 'registerImageCandidate', 'imageCandidateSignature',
     'hasDocumentAttachment', 'hasVideoSurface', 'isLikelyTimestampOrNameOnly',
     'isQuoteStamp', 'quoteEvidenceSelector', 'quoteContainerEvidenceScore', 'isRealQuoteContainer',
+    'normalizeReadMoreLabel', 'isReadMoreLabel', 'messageQuality',
+    'elementClassName', 'isMessageBlockElement', 'isListMarkerText', 'joinInlinePieces',
+    'pushMessageLine', 'walkMessageNode', 'serializeMessageElements', 'findMessageTextRoots',
     'extractReplyPreview', 'extractReplySender', 'extractQuotedMessageId', 'isQuotedOrLinkPreview',
     'downloadImageCapture', 'captureImageSmart', 'buildExportZipBundle', 'canAttemptImageState',
     'buildChatJsonFilename', 'buildChatJsonPayload', 'buildExportSummaryJson', 'sanitizeChatForJson',
@@ -143,16 +179,35 @@ function setup(extraNames = []) {
     let start = source.indexOf(`  function ${name}(`);
     if (start < 0) start = source.indexOf(`  async function ${name}(`);
     assert.notEqual(start, -1, name);
-    const closing = /^  }\r?$/m.exec(source.slice(start));
+    const closing = /\n  }\r?\n/m.exec(source.slice(start));
     assert.ok(closing, `${name} closing brace`);
     const end = start + closing.index + closing[0].length;
     vm.runInContext(source.slice(start, end), context);
   }
   return context;
 }
+function textLeaves(parent, value) {
+  const lines = String(value || '').split('\n');
+  lines.forEach((line, index) => {
+    if (index > 0) parent.appendChild(new Element(index, parent, 'BR'));
+    if (!line) return;
+    const leaf = new Element(index, parent, 'SPAN');
+    leaf.nodeType = 1;
+    leaf.textContent = line;
+    leaf.innerText = line;
+    parent.appendChild(leaf);
+  });
+}
 function bubble(images = [], text = null) {
   const root = new Element();
-  root.nodes = { 'img, canvas': images, '.selectable-text': text ? [{ innerText: text, closest: () => null }] : [] };
+  const textNode = text ? new Element(0, root) : null;
+  if (textNode) {
+    textNode.innerText = text;
+    textNode.className = 'selectable-text copyable-text';
+    textNode.closest = () => null;
+    textLeaves(textNode, text);
+  }
+  root.nodes = { 'img, canvas': images, '.selectable-text': textNode ? [textNode] : [] };
   return root;
 }
 
@@ -170,6 +225,8 @@ function multiBlockBubble(blocks, images = []) {
   for (const block of blocks) {
     const el = new Element(0, root);
     el.innerText = block.text;
+    el.className = 'selectable-text copyable-text';
+    textLeaves(el, block.text);
     if (block.quoted) {
       // closest() mengembalikan kontainer quoted untuk elemen ini.
       el.excluded = quoteContainer;
@@ -773,6 +830,159 @@ test('duplicate adjacent blocks in one message are merged without repetition', (
   assert.equal(message.text, 'Bagian pertama pesan\nbagian kedua');
   assert.equal(message.reply_to, null);
 });
+test('nested .selectable-text blocks are not double-extracted', () => {
+  const api = setup();
+  const root = new Element();
+  const outer = new Element(0, root);
+  outer.innerText = 'Laporan lengkap\n• poin satu\n• poin dua';
+  outer.className = 'selectable-text copyable-text';
+  outer.textContent = '';
+  const heading = new Element(0, outer);
+  heading.tagName = 'SPAN';
+  heading.textContent = 'Laporan lengkap';
+  heading.innerText = 'Laporan lengkap';
+  outer.appendChild(heading);
+  const inner = new Element(1, outer);
+  inner.innerText = '• poin satu\n• poin dua';
+  inner.className = 'selectable-text';
+  textLeaves(inner, inner.innerText);
+  outer.appendChild(inner);
+  root.nodes = { '.selectable-text': [outer, inner] };
+  const message = api.parseMessageNode(root, 0);
+  assert.equal(message.text, 'Laporan lengkap\n• poin satu\n• poin dua');
+});
+
+test('read more label inside message body is dropped, message kept whole', () => {
+  const api = setup();
+  const root = multiBlockBubble([
+    { text: 'Pembuka laporan yang sangat panjang' },
+    { text: 'Read more' },
+    { text: 'Sisa laporan setelah ekspansi' }
+  ]);
+  const message = api.parseMessageNode(root, 0);
+  // Label UI tidak boleh ikut menjadi isi pesan.
+  assert.equal(
+    message.text,
+    'Pembuka laporan yang sangat panjang\nSisa laporan setelah ekspansi'
+  );
+});
+
+test('isReadMoreLabel recognizes Indonesian and English variants', () => {
+  const api = setup();
+  for (const label of [
+    'Read more', 'read more…', 'Read  more.', 'Show more',
+    'Baca selengkapnya', 'baca selengkapnya…', 'Lihat selengkapnya'
+  ]) {
+    assert.equal(api.isReadMoreLabel(label), true, label);
+  }
+  // Frasa serupa di tengah kalimat TIDAK boleh dianggap tombol.
+  assert.equal(api.isReadMoreLabel('Klik read more untuk detail tiket'), false);
+  assert.equal(api.isReadMoreLabel(''), false);
+});
+
+test('similar-but-different fragments around read more are not dropped', () => {
+  const api = setup();
+  const root = multiBlockBubble([
+    { text: 'Bagian A' },
+    { text: 'Bagian A Bagian B' }
+  ]);
+  const message = api.parseMessageNode(root, 0);
+  assert.equal(message.text, 'Bagian A\nBagian A Bagian B');
+});
+
+function lexicalSpan(parent, text, format = '') {
+  const span = new Element(0, parent);
+  span.tagName = 'SPAN';
+  span.className = `selectable-text${format ? ` ${format}` : ''}`;
+  span.attrs['data-lexical-text'] = 'true';
+  span.textContent = text;
+  span.innerText = text;
+  parent.appendChild(span);
+  return span;
+}
+
+function listItem(parent, marker, sentence) {
+  const item = new Element(0, parent);
+  item.tagName = 'LI';
+  item.className = 'selectable-text copyable-text';
+  item.setAttribute = (key, value) => { item.attrs[key] = value; };
+  lexicalSpan(item, marker);
+  lexicalSpan(item, sentence);
+  parent.appendChild(item);
+  return item;
+}
+
+test('whatsapp numbered and bullet lists stay in order without duplication', () => {
+  const api = setup();
+  const root = new Element();
+  const copyable = new Element(0, root);
+  copyable.className = 'copyable-text selectable-text';
+  copyable.closest = () => null;
+  const lines = [
+    ['Informasi Pusdalyan', ''],
+    ['Tindak Lanjut:', 'strong'],
+    ['1.', 'Pamka membuat BA dan edukasi regulasi penumpang tanpa tiket.'],
+    ['2.', 'Penumpang diturunkan di Sta. KLATEN.'],
+    ['3.', 'Dibuatkan BA penumpang tanpa tiket, blacklist 180 hari.']
+  ];
+  const selectable = [copyable];
+  lines.forEach((entry, index) => {
+    if (entry[0].endsWith('.')) {
+      selectable.push(listItem(copyable, entry[0], entry[1]));
+      return;
+    }
+    const row = new Element(index, copyable);
+    row.tagName = 'DIV';
+    row.className = 'selectable-text';
+    lexicalSpan(row, entry[0], entry[1]);
+    copyable.appendChild(row);
+    selectable.push(row, ...row.childNodes);
+  });
+  for (const item of copyable.childNodes.filter((node) => node.tagName === 'LI')) {
+    selectable.push(...item.childNodes);
+  }
+  root.nodes = { '.selectable-text': selectable, '.copyable-text': [copyable] };
+  const message = api.parseMessageNode(root, 0);
+  assert.equal(message.text, [
+    'Informasi Pusdalyan',
+    'Tindak Lanjut:',
+    '1. Pamka membuat BA dan edukasi regulasi penumpang tanpa tiket.',
+    '2. Penumpang diturunkan di Sta. KLATEN.',
+    '3. Dibuatkan BA penumpang tanpa tiket, blacklist 180 hari.'
+  ].join('\n'));
+  assert.equal((message.text.match(/Pamka membuat BA/g) || []).length, 1);
+  assert.equal((message.text.match(/blacklist 180 hari/g) || []).length, 1);
+});
+
+test('bold italic and monospace runs stay inline in visual order', () => {
+  const api = setup();
+  const root = new Element();
+  const copyable = new Element(0, root);
+  copyable.className = 'copyable-text selectable-text';
+  copyable.closest = () => null;
+  const row = new Element(0, copyable);
+  row.tagName = 'DIV';
+  lexicalSpan(row, 'Nama:');
+  lexicalSpan(row, 'Arysandy', 'strong');
+  lexicalSpan(row, '/');
+  lexicalSpan(row, '64647', 'em');
+  copyable.appendChild(row);
+  root.nodes = {
+    '.selectable-text': [copyable, row, ...row.childNodes],
+    '.copyable-text': [copyable]
+  };
+  const message = api.parseMessageNode(root, 0);
+  assert.equal(message.text, 'Nama: Arysandy / 64647');
+});
+
+test('longer expanded text replaces the truncated read-more capture', () => {
+  const api = setup(['messageQuality']);
+  const truncated = { text: 'Pembuka laporan', timestamp_iso: '2026-10-02T01:31:00+07:00', sender: 'A', direction: 'incoming', type: 'text' };
+  const expanded = { ...truncated, text: 'Pembuka laporan\nSisa laporan setelah ekspansi yang jauh lebih panjang' };
+  assert.ok(api.messageQuality(expanded) > api.messageQuality(truncated));
+});
+
+
 
 test('clock-only nested fallback is not captured as message text', () => {
   const api = setup();

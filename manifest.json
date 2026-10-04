@@ -6,7 +6,9 @@
   "permissions": [
     "downloads",
     "sidePanel",
-    "storage"
+    "storage",
+    "debugger",
+    "tabs"
   ],
   "minimum_chrome_version": "114",
   "host_permissions": [

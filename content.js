@@ -2452,24 +2452,17 @@
       exportedChats
     });
     const zipUrl = URL.createObjectURL(zipBlob);
-    const downloadResponse = await chrome.runtime.sendMessage({
-      type: "DOWNLOAD_FILE_URL",
-      filename: `${exportRoot}.zip`,
-      url: zipUrl,
-      saveAs: false
-    });
+    const a = document.createElement("a");
+    a.href = zipUrl;
+    a.download = `${exportRoot}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 
-    if (!downloadResponse?.ok) {
-      URL.revokeObjectURL(zipUrl);
-      throw new Error(downloadResponse?.error || "File ZIP gagal diunduh.");
-    }
-
-    // JANGAN revoke segera setelah request. chrome.downloads.download() resolve
-    // saat unduhan dimulai, tetapi service worker mungkin masih membaca object
-    // URL ini. Revoke terlalu dini membuat ZIP gagal terunduh dan hasil ekspor
-    // seolah-olah hanya berupa file terpisah. Tunda pembersihan.
+    // Revoke url untuk membebaskan memory. Beri sedikit jeda panjang (60 detik) 
+    // agar proses download Chrome (termasuk scanning) tidak terputus di tengah jalan 
+    // yang menyebabkan file "gagal diunduh" atau hilang.
     setTimeout(() => URL.revokeObjectURL(zipUrl), 60_000);
-
     return {
       ok: true,
       stoppedByUser: stoppedEarly,
@@ -2637,26 +2630,20 @@
     await sleep(420);
     row = findChatRowForEntry(pane, entry) || row;
 
-    // Bila chat sudah aktif, terima salah satu alias yang tersimpan. Ini penting
-    // pada Community karena scanner lama dapat menukar chat_name/community_name.
     const alreadyOpen = matchEntryAgainstHeader(document.querySelector("#main"), entry);
     if (alreadyOpen) {
       await waitForConversationEntry(entry, 12_000);
       return;
     }
 
-    const clickTargets = getChatClickTargets(
-      row,
-      getEntryNameAliases(entry),
-      entry.source_kind === "community_group"
-    );
+    const clickTargets = getChatClickTargets(row, [entry.name], true);
     let lastError = null;
 
     for (const target of clickTargets) {
-      activateChatTarget(target);
+      await activateChatTargetTrusted(target);
 
       try {
-        await waitForConversationEntry(entry, 12_000);
+        await waitForConversationEntry(entry, 4_000);
         return;
       } catch (error) {
         lastError = error;
@@ -2869,23 +2856,25 @@
 
     const scored = [];
     for (const row of findChatRows(pane)) {
-      const base = extractChatDescriptor(row, "all", null);
+      const base = extractChatDescriptor(row, "groups", null);
       const baseName = cleanText(base.name);
-      const localName = inferCommunityChildNameFromRow(row, baseName);
+      const localName = inferCommunityChildNameFromRow(row, baseName) || baseName;
       const localKey = normalizeComparable(localName || "");
-      const lines = extractMeaningfulRowLines(row).map(normalizeComparable);
-      const childMatches = localKey === expectedChild || lines.includes(expectedChild);
-      if (!childMatches) continue;
-      if (isAnnouncementName(localName)) continue;
+      if (localKey !== expectedChild) continue;
+      if (isAnnouncementName(localName) || base.is_community_container) continue;
 
       const baseKey = normalizeComparable(baseName);
       let score = 100;
-      if (expectedCommunity && baseKey === expectedCommunity) score += 80;
-      if (expectedCommunity && lines.includes(expectedCommunity)) score += 45;
+      if (expectedCommunity && (baseKey === expectedCommunity || normalizeComparable(base.community_name || "") === expectedCommunity)) {
+        score += 80;
+      }
+      const lines = extractMeaningfulRowLines(row).map(normalizeComparable);
+      if (expectedCommunity && lines.includes(expectedCommunity)) score += 20;
       const expectedPreview = normalizeComparable(entry?.preview || "");
       if (expectedPreview && lines.includes(expectedPreview)) score += 25;
+      if (entry?.identity_key && base.identity_key === entry.identity_key) score += 200;
 
-      const nameNode = findNameNodeInRow(row, [entry.name]);
+      const nameNode = findNameNodeInRow(row, [localName]);
       const clickRow = nameNode
         ? (findClickableRowAncestor(nameNode, pane) || row)
         : row;
@@ -2896,72 +2885,81 @@
     return scored[0]?.row || null;
   }
 
-  function findChatRowForEntry(pane, entry) {
-    // v0.8.8: subgroup Community pada build pengguna tidak selalu memiliki
-    // span[title] dengan nama subgroup. Temukan physical row dari visible text
-    // terlebih dahulu sebelum fallback ke selector title lama.
-    if (entry?.source_kind === "community_group" || entry?.community_name) {
-      const communityRow = findCommunityPhysicalRowForEntry(pane, entry);
-      if (communityRow) return communityRow;
-    }
-
-    const expectedNames = new Set(
-      getEntryNameAliases(entry).map(normalizeComparable).filter(Boolean)
+  function rowCarriesExactTitle(row, expectedName) {
+    const expected = normalizeComparable(expectedName || "");
+    if (!expected || !(row instanceof HTMLElement)) return false;
+    return Array.from(row.querySelectorAll("span[title], [title]")).some((element) =>
+      normalizeComparable(element.getAttribute("title")) === expected
     );
-    const titleMatches = Array.from(pane.querySelectorAll("span[title]"))
-      .filter(isVisible)
-      .filter((span) => expectedNames.has(normalizeComparable(span.getAttribute("title"))));
+  }
 
+  function findChatRowForEntry(pane, entry) {
+    const expectedName = normalizeComparable(entry?.name || "");
+    const expectedIdentity = entry?.identity_key || "";
+    if (!expectedName && !expectedIdentity) return null;
+
+    const descriptorPass = entry.community_name || entry.discovered_via === "groups" ? "groups" : "all";
     const candidates = [];
-    for (const span of titleMatches) {
-      const scanRow = findRowAncestor(span, pane);
-      const clickRow = findClickableRowAncestor(span, pane) || scanRow;
-      if (!clickRow || !isInsidePaneViewport(clickRow, pane)) continue;
+    const seen = new Set();
 
-      const descriptorPass = entry.community_name || entry.discovered_via === "groups" ? "groups" : "all";
-      const descriptor = extractChatDescriptor(
-        scanRow || clickRow,
-        descriptorPass,
-        descriptorPass === "groups" ? span : null
-      );
-      if (descriptor.is_announcement || descriptor.is_community_container) continue;
-      candidates.push({ row: clickRow, descriptor });
-    }
+    const consider = (scanRow) => {
+      if (!(scanRow instanceof HTMLElement) || seen.has(scanRow)) return;
+      if (!isInsidePaneViewport(scanRow, pane)) return;
+      seen.add(scanRow);
 
-    if (candidates.length === 0) {
-      for (const scanRow of findChatRows(pane)) {
-        const descriptor = extractChatDescriptor(
-          scanRow,
-          entry.community_name || entry.discovered_via === "groups" ? "groups" : "all"
-        );
-        const descriptorAliases = new Set(
-          [descriptor.name, descriptor.community_name, ...(descriptor.title_aliases || [])]
-            .map(normalizeComparable)
-            .filter(Boolean)
-        );
-        const overlaps = [...expectedNames].some((name) => descriptorAliases.has(name));
-        if (descriptor.name && !descriptor.is_announcement && !descriptor.is_community_container && overlaps) {
-          const nameNode = findNameNodeInRow(scanRow, getEntryNameAliases(entry));
-          const clickRow = nameNode
-            ? (findClickableRowAncestor(nameNode, pane) || scanRow)
-            : scanRow;
-          candidates.push({ row: clickRow, descriptor });
-        }
+      const descriptor = extractChatDescriptor(scanRow, descriptorPass);
+      const titleHit = rowCarriesExactTitle(scanRow, entry?.name);
+      const resolvedName = titleHit ? entry.name : descriptor.name;
+      if (!resolvedName) return;
+      if (descriptor.is_announcement) return;
+      if (descriptor.is_community_container && !titleHit) return;
+
+      const nameMatches = normalizeComparable(resolvedName) === expectedName;
+      const identityMatches = Boolean(expectedIdentity) && descriptor.identity_key === expectedIdentity;
+      if (!nameMatches && !identityMatches) return;
+
+      const nameNode = findNameNodeInRow(scanRow, [resolvedName]);
+      const clickRow = nameNode
+        ? (findClickableRowAncestor(nameNode, pane) || scanRow)
+        : scanRow;
+      candidates.push({
+        row: clickRow,
+        descriptor: { ...descriptor, name: resolvedName },
+        nameMatches,
+        titleHit
+      });
+    };
+
+    for (const scanRow of findChatRows(pane)) consider(scanRow);
+    if (expectedName) {
+      for (const span of pane.querySelectorAll("span[title]")) {
+        if (!isVisible(span)) continue;
+        if (normalizeComparable(span.getAttribute("title")) !== expectedName) continue;
+        consider(findRowAncestor(span, pane) || findClickableRowAncestor(span, pane));
       }
     }
 
     if (candidates.length === 0) return null;
 
+    const titled = candidates.filter((candidate) => candidate.titleHit && candidate.nameMatches);
+    const identityMatches = expectedIdentity
+      ? candidates.filter((candidate) => candidate.descriptor.identity_key === expectedIdentity && candidate.nameMatches)
+      : [];
+    const named = candidates.filter((candidate) => candidate.nameMatches);
+    const pool = titled.length > 0
+      ? titled
+      : identityMatches.length > 0
+        ? identityMatches
+        : named;
+    if (pool.length === 0) return null;
+
     const expectedCommunity = normalizeComparable(entry.community_name || "");
     const expectedPreview = normalizeComparable(entry.preview || "");
-    const expectedIdentity = entry.identity_key || "";
-
-    candidates.sort((a, b) =>
+    pool.sort((a, b) =>
       scoreChatRowForEntry(b.descriptor, expectedCommunity, expectedPreview, expectedIdentity) -
       scoreChatRowForEntry(a.descriptor, expectedCommunity, expectedPreview, expectedIdentity)
     );
-
-    return candidates[0].row;
+    return pool[0].row;
   }
 
   function findNameNodeInRow(row, expectedNames) {
@@ -3084,6 +3082,19 @@
     return uniqueElements(targets).filter((target) => target instanceof HTMLElement);
   }
 
+  async function trustedClickAt(x, y) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "TRUSTED_CLICK",
+        x,
+        y
+      });
+      return response?.ok === true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function activateChatTarget(target) {
     target.scrollIntoView({ block: "center", inline: "nearest" });
     target.focus?.({ preventScroll: true });
@@ -3136,11 +3147,23 @@
     target.click();
   }
 
+  async function activateChatTargetTrusted(target) {
+    if (!(target instanceof HTMLElement)) return false;
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    await sleep(180);
+
+    const rectangle = target.getBoundingClientRect();
+    if (rectangle.width < 2 || rectangle.height < 2) return false;
+    const clientX = Math.round(rectangle.left + Math.min(rectangle.width / 2, 140));
+    const clientY = Math.round(rectangle.top + rectangle.height / 2);
+    const trusted = await trustedClickAt(clientX, clientY);
+    if (!trusted) activateChatTarget(target);
+    return trusted;
+  }
+
   function getEntryNameAliases(entry) {
     return Array.from(new Set([
-      cleanText(entry?.name),
-      cleanText(entry?.community_name),
-      ...((entry?.title_aliases || []).map(cleanText))
+      cleanText(entry?.name)
     ].filter(Boolean)));
   }
 
@@ -3160,18 +3183,35 @@
     return strict.length ? strict : [entry.name].filter(Boolean);
   }
 
+  function chatIdentityToken(value) {
+    const raw = cleanText(value);
+    const jid = raw.match(/(\d{6,20})@(?:c\.us|g\.us|s\.whatsapp\.net|lid)/i);
+    if (jid) return jid[1];
+    const prefixed = raw.match(/(?:^|_)(\d{6,20})@/);
+    return prefixed ? prefixed[1] : "";
+  }
+
+  function currentConversationIdentity() {
+    const main = document.querySelector("#main");
+    if (!main) return "";
+    const nodes = [
+      main,
+      ...Array.from(main.querySelectorAll("[data-id]")).slice(0, 12)
+    ];
+    for (const node of nodes) {
+      const token = chatIdentityToken(node.getAttribute?.("data-id") || node.id || "");
+      if (token) return token;
+    }
+    return "";
+  }
+
   function matchEntryAgainstHeader(main, entry) {
     if (!main) return null;
-    const aliases = new Map(
-      getHeaderAliasesForEntry(entry).map((name) => [normalizeComparable(name), name])
-    );
-    if (aliases.size === 0) return null;
+    const expected = normalizeComparable(entry?.name || "");
+    if (!expected) return null;
 
     for (const candidate of getHeaderNameCandidates(main)) {
-      const key = normalizeComparable(candidate);
-      if (aliases.has(key)) {
-        return aliases.get(key);
-      }
+      if (normalizeComparable(candidate) === expected) return entry.name;
     }
     return null;
   }
@@ -3249,7 +3289,7 @@
       entry.community_name = oldName || null;
       entry.source_kind = "community_group";
     } else if (matchedKey !== normalizeComparable(oldName)) {
-      entry.name = matched;
+      return;
     }
 
     entry.title_aliases = Array.from(new Set([
@@ -3271,6 +3311,14 @@
       const matchKey = normalizeComparable(matchedName || "");
 
       if (main && matchedName) {
+        const expectedChatId = chatIdentityToken(entry?.identity_key || "");
+        const activeChatId = currentConversationIdentity();
+        if (expectedChatId && activeChatId && expectedChatId !== activeChatId) {
+          stableMatches = 0;
+          lastMatchKey = "";
+          await sleep(180);
+          continue;
+        }
         if (matchKey === lastMatchKey) stableMatches += 1;
         else {
           lastMatchKey = matchKey;
@@ -3325,47 +3373,19 @@
   }
 
   function getHeaderNameCandidates(main) {
-    if (!main) {
-      return [];
-    }
-
+    if (!main) return [];
     const header = main.querySelector("header");
-    if (!header) {
-      return [];
-    }
+    if (!header) return [];
 
-    const candidates = [];
-    const add = (value) => {
-      const cleaned = cleanText(value);
-      if (cleaned && cleaned.length <= 300) {
-        candidates.push(cleaned);
-      }
-    };
+    const title = header.querySelector('span[title], [role="button"] span[dir="auto"]');
+    const titled = cleanText(title?.getAttribute?.("title") || title?.textContent);
+    if (titled && titled.length <= 300) return [titled];
 
-    // Nama chat bisa berada pada textContent, title, atau aria-label,
-    // tergantung tipe chat dan versi antarmuka WhatsApp Web.
-    const elements = header.querySelectorAll(
-      'span[title], [title], span[dir="auto"], [aria-label], [role="button"] span'
-    );
-
-    for (const element of elements) {
-      if (!isVisible(element)) {
-        continue;
-      }
-
-      add(element.getAttribute?.("title"));
-      add(element.getAttribute?.("aria-label"));
-      add(element.textContent);
-    }
-
-    for (const line of cleanText(header.innerText)
+    const firstLine = cleanText(header.innerText)
       .split("\n")
       .map(cleanText)
-      .filter(Boolean)) {
-      add(line);
-    }
-
-    return Array.from(new Set(candidates));
+      .find(Boolean);
+    return firstLine ? [firstLine] : [];
   }
 
   function extractCurrentChatName(main, expectedName = null) {
@@ -3435,13 +3455,18 @@
             : null
         };
         const existing = collector.get(message.id);
+        const incomingKey = messageFingerprint(orderedMessage);
+        const duplicate = existing || Array.from(collector.values()).find((stored) =>
+          messageFingerprint(stored) === incomingKey
+        );
 
-        if (
-          !existing ||
-          messageQuality(orderedMessage) > messageQuality(existing)
-        ) {
+        if (!duplicate) {
+          collector.set(message.id, orderedMessage);
+        } else if (messageQuality(orderedMessage) > messageQuality(duplicate)) {
+          collector.delete(duplicate.id);
           collector.set(message.id, orderedMessage);
         } else if (
+          duplicate === existing &&
           !Number.isFinite(existing.dom_order_position) &&
           Number.isFinite(orderPosition)
         ) {
@@ -3475,6 +3500,12 @@
       scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
       await sleep(650);
     }
+
+    // Klik semua tombol "Read more" / "Baca selengkapnya" yang terlihat dan
+    // tunggu ekspansinya selesai SEBELUM membaca teks. Tanpa langkah ini,
+    // pesan yang sangat panjang terpotong dan potongan-potongannya terbaca
+    // sebagai blok terpisah (menyebabkan teks terulang / teracak).
+    await expandVisibleReadMoreToggles(main);
 
     collect();
     if (options.exportImages) {
@@ -3536,6 +3567,10 @@
           // Beri virtual list waktu menyelesaikan satu render tambahan. Kadang
           // satu batch muncul bertahap setelah perubahan pertama terdeteksi.
           await sleep(350);
+          // Setiap batch baru bisa memuat pesan terpotong. Klik "Read more"
+          // dan tunggu load-nya SEBELUM collect(), kalau tidak potongan pendek
+          // tersimpan lalu bubble-nya di-unmount saat scroll berikutnya.
+          await expandVisibleReadMoreToggles(main);
           collect();
         } else {
           noProgressRounds += 1;
@@ -3587,6 +3622,12 @@
     }
     await settleImageCaptures(imageStates);
 
+    // Pass akhir: setelah scroll jauh ke atas, beberapa pesan lama yang panjang
+    // mungkin baru ter-render dan masih terpotong "Read more". Ekspansi mereka
+    // sekarang, lalu kumpulkan ulang agar teksnya utuh sebelum dibaca final.
+    await expandRemainingReadMoreToggles(main, scroller);
+    collect();
+
     let messages = Array.from(collector.values());
     messages.sort(compareMessages);
 
@@ -3601,9 +3642,16 @@
         ...publicMessage
       } = message;
       return {
-        ...publicMessage,
         sequence: index + 1,
-        media: finalizeMessageMedia(publicMessage, imageStates, options)
+        id: publicMessage.id,
+        sender: publicMessage.sender,
+        timestamp_raw: publicMessage.timestamp_raw,
+        timestamp_iso: publicMessage.timestamp_iso,
+        direction: publicMessage.direction,
+        type: publicMessage.type,
+        text: publicMessage.text,
+        media: finalizeMessageMedia(publicMessage, imageStates, options),
+        reply_to: publicMessage.reply_to
       };
     });
 
@@ -3628,12 +3676,17 @@
         source: state.source
       }));
 
-    // Kembalikan percakapan ke bagian terbaru sebelum berpindah ke chat lain.
-    // Ini mencegah posisi scroll lama mengganggu render panel berikutnya.
+    // Kembalikan percakapan ke bagian TERATAS (pesan terlama yang baru di-load)
+    // sebelum berpindah ke chat lain. Menggulir paksa ke bawah akan memicu
+    // WhatsApp membuang (dispose) seluruh batch pesan lama yang sudah susah
+    // payah di-load, sehingga bubble tertua ter-unmount SEBELUM pembacaan
+    // final -> sebagian pesan tidak terdeteksi. Biarkan virtual list tetap di
+    // atas; chat berikutnya membuka halamannya sendiri dari awal.
     if (scroller?.isConnected) {
-      scroller.scrollTop = scroller.scrollHeight;
+      scroller.scrollTop = 0;
       scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-      await sleep(450);
+      await sleep(300);
+      collect();
     }
 
     return {
@@ -3677,7 +3730,7 @@
 
     const currentTop = Math.max(0, Number(scroller.scrollTop || 0));
     const viewportHeight = Math.max(300, Number(scroller.clientHeight || 0));
-    const distance = Math.max(620, Math.floor(viewportHeight * 0.95));
+    const distance = Math.max(280, Math.floor(viewportHeight * 0.55));
     const nextTop = currentTop <= 100 ? 0 : Math.max(0, currentTop - distance);
 
     try {
@@ -3792,6 +3845,8 @@
         previousTop = currentTop;
       }
 
+      const stableForMs = Date.now() - lastDomMovementAt;
+
       // Jika WhatsApp masih menampilkan indikator pemuatan atau struktur scroll
       // masih berubah, tunggu sampai batas maksimum alih-alih menganggap gagal.
       const loading = isOlderMessagesLoading(main);
@@ -3800,7 +3855,21 @@
         // Beri waktu tambahan bila indikator pemuatan nyata terlihat, terbatas.
         if (Date.now() - loadingSince >= 600) extraWaitMs = Math.min(20_000, maxWaitMs);
       } else loadingSince = null;
-      const stableForMs = Date.now() - lastDomMovementAt;
+
+      collect();
+
+      // FIX: Jangan langsung return true saat ada 1 pesan baru terkumpul.
+      // Tunggu sampai DOM stabil (tidak ada perubahan tinggi/scroll) selama
+      // setidaknya 400ms untuk memastikan baris-baris pesan sudah selesai merender
+      // konten asinkronnya (teks, metadata, dll).
+      if (getCollectedCount() > countBefore && stableForMs >= 400) {
+        return {
+          progress: true,
+          waitedMs: Date.now() - startedAt,
+          scrollerLost: false,
+          scroller: activeScroller
+        };
+      }
 
       // Saat tidak berada di dekat atas dan tidak ada perubahan sama sekali,
       // lakukan dorongan tambahan supaya virtual list terus bergerak ke atas.
@@ -4030,16 +4099,21 @@
   }
 
   function findRenderedMessageRoots(main) {
-    const nodes = Array.from(main.querySelectorAll(
+    const nodes = Array.from(main.querySelectorAll('[data-id]')).filter((row) => 
+      row.querySelector('.copyable-text, .selectable-text, [data-testid="selectable-text"], [data-pre-plain-text]')
+    );
+    const legacy = Array.from(main.querySelectorAll(
       '[data-pre-plain-text], .message-in, .message-out, [data-id^="true_"], [data-id^="false_"], [id^="true_"], [id^="false_"]'
     ));
+    const combined = [...new Set([...nodes, ...legacy])];
+    
     // Beberapa layout media-only hanya menyediakan row, tanpa metadata caption.
     // Batasi fallback ke row berisi media agar header/sidebar tidak menjadi pesan.
     for (const row of main.querySelectorAll('[role="row"]')) {
-      if (nodes.some((node) => row.contains(node) || node.contains(row))) continue;
-      if (findMessageImages(row).length > 0) nodes.push(row);
+      if (combined.some((node) => row.contains(node) || node.contains(row))) continue;
+      if (findMessageImages(row).length > 0) combined.push(row);
     }
-    const roots = [...new Set(nodes.map(findMessageBubble))];
+    const roots = [...new Set(combined.map(findMessageBubble))];
     // Satu bubble album dapat berisi beberapa node metadata/ID tile.
     return roots.filter((root) => !roots.some((other) => other !== root && other.contains(root)));
   }
@@ -4064,10 +4138,26 @@
 
   function parseMessageNode(metadataNode, captureOrder) {
     const bubble = findMessageBubble(metadataNode);
-    const metadataRaw = cleanText(
+    let metadataRaw = cleanText(
       metadataNode.getAttribute("data-pre-plain-text") ||
       bubble.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text")
     );
+
+    // Jika pesan digrup (misal pesan beruntun dari pengirim yang sama),
+    // hanya bubble pertama yang memiliki data-pre-plain-text.
+    // Warisi metadata dari pesan sebelumnya di DOM.
+    if (!metadataRaw) {
+      let prev = bubble.previousElementSibling;
+      while (prev) {
+        const pre = prev.getAttribute("data-pre-plain-text") || prev.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text");
+        if (pre) {
+          metadataRaw = cleanText(pre);
+          break;
+        }
+        prev = prev.previousElementSibling;
+      }
+    }
+
     const parsedMetadata = parsePrePlainText(metadataRaw);
     const direction = detectDirection(bubble);
     const media = detectMedia(bubble);
@@ -4084,10 +4174,16 @@
       return null;
     }
 
+    if (!parsedMetadata.sender || !parsedMetadata.timestampIso) {
+      return null;
+    }
+
     const nativeId = extractNativeMessageId(metadataNode, bubble);
     const idSource = [
       nativeId,
       metadataRaw,
+      parsedMetadata.sender,
+      parsedMetadata.timestampRaw,
       type,
       text
     ]
@@ -5514,39 +5610,388 @@
     return toLocalIsoString(date);
   }
 
-  function extractMessageText(metadataNode, bubble, captionOnly = false) {
-    const selectable = Array.from(
-      bubble.querySelectorAll(".selectable-text")
-    )
-      .filter(isVisible)
-      .filter((element) => !isQuotedOrLinkPreview(element, bubble))
-      .map((element) => cleanText(element.innerText))
-      .filter(Boolean);
+  // ---------------------------------------------------------------------
+  // Ekspansi pesan panjang ("Read more" / "Baca selengkapnya")
+  // ---------------------------------------------------------------------
+  //
+  // WhatsApp Web memotong pesan yang sangat panjang menjadi POTONGAN TEKS
+  // TERPISAH yang diselingi tombol "Read more…". Akibatnya:
+  //   1) innerText bubble TIDAK memuat sisa pesan (terpotong),
+  //   2) potongan-potongan terpisah itu bisa terbaca sebagai BLOK BERBEDA dan
+  //      tergabung di urutan yang salah -> teks tampak TERULANG / TERACAK.
+  // Scraper wajib MENGKLIK tombol itu (pointer sequence lengkap + click) dan
+  // MENUNGGU sampai sisa pesan benar-benar ter-load sebelum teks dibaca.
 
-    if (selectable.length > 0) {
-      // WhatsApp Web modern merender SATU pesan panjang sebagai beberapa blok
-      // .selectable-text (header laporan, isi, penutup). Sebelumnya hanya blok
-      // TERAKHIR yang diambil sehingga potongan awal pesan hilang dan dianggap
-      // quoted reply palsu oleh extractReplyPreview(). Gabungkan seluruh blok
-      // milik pesan ini (urutan DOM) menjadi satu teks utuh. Blok yang berada
-      // di dalam kontainer quote/preview sudah disaring di atas.
-      const seen = new Set();
-      return selectable
-        .filter((text) => {
-          const key = normalizeComparable(text);
-          if (!key || seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        })
-        .join("\n");
+  // Pola kelas pembungkus tombol read more pada build WhatsApp Web saat ini.
+  const READ_MORE_CLASS_PATTERN =
+    /read[-_ ]?more|expand|truncat|show[-_ ]?more|collapse/i;
+
+  // Selector elemen yang mungkin menjadi tombol "read more". Disengaja luas
+  // (span/div) karena WhatsApp sering merendernya sebagai span[role=button]
+  // generik tanpa tag <button>; pencocokan teks dilakukan terpisah.
+  const READ_MORE_CANDIDATE_SELECTOR =
+    'button, [role="button"], a, span[tabindex], div[tabindex], ' +
+    '[class*="read-more"], [class*="read_more"], ' +
+    '[data-icon*="chevron"], [data-icon*="down"]';
+
+  function elementMatchesReadMoreByLabel(element) {
+    if (!element) return false;
+    const labels = [
+      element.getAttribute?.("aria-label"),
+      element.getAttribute?.("title")
+    ];
+    if (labels.some((value) => value && isReadMoreLabel(value))) return true;
+
+    // Cocokkan teks elemen saja bila elemennya KECIL (tidak memuat seluruh
+    // isi pesan). Elemen besar (bubble/induk) tidak boleh dipicu oleh teks.
+    const text = cleanText(element.textContent || "");
+    if (text && text.length <= 48 && isReadMoreLabel(text)) {
+      // Hindari false-positive pada bubble/induk: tombol asli umumnya tidak
+      // memiliki turunan kompleks. Izinkan hingga 3 turunan (mis. ikon ▾).
+      const descendants = element.querySelectorAll?.("*")?.length || 0;
+      if (descendants <= 3) return true;
+    }
+    return false;
+  }
+
+  function findReadMoreToggleInBubble(bubble) {
+    if (!bubble?.querySelectorAll) return null;
+
+    // 1) Kandidat eksplisit berdasarkan selector struktural.
+    for (const element of bubble.querySelectorAll(READ_MORE_CANDIDATE_SELECTOR)) {
+      if (!isVisible(element)) continue;
+      if (isQuotedOrLinkPreview(element, bubble)) continue;
+      if (elementMatchesReadMoreByLabel(element)) return element;
     }
 
-    // Jangan menjadikan durasi video atau jam pesan sebagai caption media.
+    // 2) Fallback: pindai elemen kecil berciri kelas expand/truncate. Ini
+    //    menangkap build yang menamai tombol hanya lewat kelas CSS-in-JS.
+    for (const element of bubble.querySelectorAll("button, [role='button'], span, div")) {
+      if (!isVisible(element)) continue;
+      if (isQuotedOrLinkPreview(element, bubble)) continue;
+      const className = String(element.className || "");
+      if (!READ_MORE_CLASS_PATTERN.test(className)) continue;
+      const text = cleanText(element.textContent || "");
+      // Terima bila labelnya cocok ATAU elemennya sangat kecil (hanya ikon).
+      if (isReadMoreLabel(text) || (!text && (element.querySelectorAll?.("*")?.length || 0) <= 2)) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  function bubbleTextSnapshot(bubble) {
+    let textLength = 0;
+    let selectableCount = 0;
+    try {
+      for (const element of bubble.querySelectorAll(".selectable-text")) {
+        selectableCount += 1;
+        textLength += cleanText(element.innerText || element.textContent || "").length;
+      }
+      if (textLength === 0) {
+        textLength = cleanText(bubble.innerText || bubble.textContent || "").length;
+      }
+    } catch (_error) {
+      // Abaikan; snapshot hanya indikator kemajuan.
+    }
+    return { textLength, selectableCount };
+  }
+
+  // Klik satu tombol read more dan tunggu sampai teks pesan bertambah panjang
+  // (ekspansi selesai) atau timeout. Mengembalikan true bila teks bertambah.
+  async function clickReadMoreToggle(toggle, bubble, timeoutMs = 2_500) {
+    if (!toggle) return false;
+    
+    let currentToggle = toggle;
+    let anyExpanded = false;
+    let attempts = 0;
+
+    while (currentToggle && attempts < 10) {
+      const before = bubbleTextSnapshot(bubble);
+      dispatchClickSequence(currentToggle);
+      
+      const deadline = Date.now() + timeoutMs;
+      let expandedThisTime = false;
+
+      while (Date.now() < deadline) {
+        await sleep(120);
+        if (isStopRequested()) break;
+        
+        if (!currentToggle.isConnected) {
+          expandedThisTime = true;
+          break;
+        }
+        
+        const after = bubbleTextSnapshot(bubble);
+        const grew = after.textLength > before.textLength || after.selectableCount > before.selectableCount;
+        if (grew) {
+          expandedThisTime = true;
+          break;
+        }
+      }
+
+      if (!expandedThisTime) break;
+      
+      anyExpanded = true;
+      await sleep(180);
+      
+      currentToggle = findReadMoreToggleInBubble(bubble);
+      attempts++;
+    }
+
+    return anyExpanded;
+  }
+
+  // Klik SEMUA tombol read more yang terlihat saat ini (satu pass).
+  // Mengembalikan jumlah tombol yang berhasil memicu ekspansi.
+  async function expandVisibleReadMoreToggles(main) {
+    if (!main?.querySelectorAll) return 0;
+    let expanded = 0;
+    const bubbles = findRenderedMessageRoots(main);
+    for (const bubble of bubbles) {
+      if (isStopRequested()) break;
+      const toggle = findReadMoreToggleInBubble(bubble);
+      if (toggle && (await clickReadMoreToggle(toggle, bubble))) {
+        expanded += 1;
+      }
+    }
+    return expanded;
+  }
+
+  // Setelah scroll ke atas, beberapa pesan lama yang panjang belum sempat
+  // diekspansi. Pass ini mengekspansi bubble yang tertinggal agar tidak ada
+  // pesan yang terpotong saat pembacaan final.
+  async function expandRemainingReadMoreToggles(main, scroller, maxPasses = 8) {
+    let total = 0;
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+      if (isStopRequested()) break;
+      const expanded = await expandVisibleReadMoreToggles(main);
+      total += expanded;
+      if (expanded === 0) break;
+      // Setelah satu bubble melebar, virtual list menggeser tetangga. Gulir
+      // pelan ke bawah lalu ke atas supaya bubble yang tadinya di luar viewport
+      // (masih terlipat) sempat dirender dan diklik juga.
+      if (scroller?.isConnected) {
+        const height = Math.max(240, Number(scroller.clientHeight || 0));
+        const down = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.floor(height * 0.7));
+        scroller.scrollTop = down;
+        scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await sleep(280);
+        await expandVisibleReadMoreToggles(main);
+        const up = Math.max(0, down - Math.floor(height * 0.85));
+        scroller.scrollTop = up;
+        scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await sleep(280);
+      }
+    }
+    return total;
+  }
+
+  function elementClassName(element) {
+    const value = element?.className;
+    if (typeof value === "string") return value;
+    if (value && typeof value.baseVal === "string") return value.baseVal;
+    return "";
+  }
+
+  function isMessageBlockElement(element) {
+    const blockTags = new Set([
+      "DIV", "P", "LI", "UL", "OL", "H1", "H2", "H3", "H4", "BLOCKQUOTE",
+      "TR", "SECTION", "ARTICLE", "PRE"
+    ]);
+    const tag = String(element?.tagName || "").toUpperCase();
+    if (blockTags.has(tag)) return true;
+    const role = element?.getAttribute?.("role") || "";
+    if (role === "listitem" || role === "list") return true;
+    return /copyable-text|quoted-mention|_aj-|_ao3/i.test(elementClassName(element));
+  }
+
+  function isListMarkerText(value) {
+    const text = cleanText(value);
+    if (!text || text.length > 12) return false;
+    return (
+      /^\d{1,3}[.)]$/.test(text) ||
+      /^[•·●◦▪▫‣⁃–—\-]$/.test(text) ||
+      /^[a-zA-Z][.)]$/.test(text)
+    );
+  }
+
+  function joinInlinePieces(pieces) {
+    let line = "";
+    for (const raw of pieces) {
+      const piece = String(raw || "").replace(/[ \t\n]+/g, " ").trim();
+      if (!piece) continue;
+      if (!line) {
+        line = piece;
+        continue;
+      }
+      if (isListMarkerText(line) && !/\s$/.test(line)) {
+        line += ` ${piece}`;
+        continue;
+      }
+      const needsSpace = !/[\s(\[{“"']$/.test(line) && !/^[,.;:!?%)\]}”"']/.test(piece);
+      line += needsSpace ? ` ${piece}` : piece;
+    }
+    return cleanText(line);
+  }
+
+  function pushMessageLine(lines, line, { allowBlank = false } = {}) {
+    if (line === "" && allowBlank) {
+      lines.push("");
+      return;
+    }
+    const value = cleanText(line);
+    if (!value || isReadMoreLabel(value)) return;
+    lines.push(value);
+  }
+
+  function walkMessageNode(node, lines, bubble) {
+    if (!node) return [];
+    
+    // Skip if this node is part of a quoted message or link preview
+    if (node.nodeType === 1 && isQuotedOrLinkPreview(node, bubble)) return [];
+
+    const nodeType = node.nodeType;
+    if (nodeType === 3) {
+      const value = String(node.textContent || "").replace(/[\u200b\u200c\ufeff]/g, "");
+      return value.trim() ? [value] : [];
+    }
+    if (nodeType !== 1 && nodeType !== undefined) return [];
+
+    const tag = String(node.tagName || "").toUpperCase();
+    if (tag === "BR") return [];
+    
+    // Check for WhatsApp's internal list markers or custom prefixes
+    let preText = "";
+    if (nodeType === 1 && node.hasAttribute && node.hasAttribute("data-pre-plain-text")) {
+      const rawPre = node.getAttribute("data-pre-plain-text");
+      // WhatsApp adds a prefix like "[03:48, 3/10/2026] Name: " to the outer wrapper.
+      // In some locales/settings, time uses dot instead of colon "[03.48, 3/10/2026] Name: ".
+      // We only want list markers like "1. ", "* ", "- ", "A. "
+      if (!/^\[\d{2}[:.]\d{2}.*?\]/.test(rawPre)) {
+        preText = rawPre;
+      }
+    }
+
+    const children = node.childNodes?.length
+      ? Array.from(node.childNodes)
+      : Array.from(node.children || []);
+
+    if (children.length === 0) {
+      let own = cleanText(node.innerText || node.textContent || "");
+      if (preText && own && !own.startsWith(preText)) own = preText + own;
+      return own ? [own] : [];
+    }
+
+    const inline = [];
+    if (preText) inline.push(preText);
+
+    let emittedBlock = false;
+    const flushInline = () => {
+      if (inline.length === 0) return;
+      pushMessageLine(lines, joinInlinePieces(inline.splice(0, inline.length)));
+    };
+
+    for (const child of children) {
+      const childTag = String(child.tagName || "").toUpperCase();
+      const childIsElement = child.nodeType !== 3;
+      if (childTag === "BR") {
+        flushInline();
+        emittedBlock = true;
+        continue;
+      }
+      const childIsBlock = childIsElement && isMessageBlockElement(child);
+      if (!childIsBlock) {
+        inline.push(...walkMessageNode(child, lines, bubble));
+        continue;
+      }
+      flushInline();
+      emittedBlock = true;
+      walkMessageNode(child, lines, bubble);
+    }
+    flushInline();
+
+    if (emittedBlock || isMessageBlockElement(node)) return [];
+    return inline;
+  }
+
+  function serializeMessageElements(elements, bubble) {
+    const paragraphs = [];
+    for (const element of elements) {
+      const lines = [];
+      const inline = walkMessageNode(element, lines, bubble);
+      pushMessageLine(lines, joinInlinePieces(inline));
+      const merged = [];
+      let previousBlank = false;
+      for (const line of lines) {
+        if (line === "") {
+          if (merged.length > 0 && !previousBlank) {
+            merged.push("");
+            previousBlank = true;
+          }
+          continue;
+        }
+        previousBlank = false;
+        const previous = merged.length ? merged[merged.length - 1] : "";
+        if (previous && isListMarkerText(previous)) {
+          merged[merged.length - 1] = `${previous} ${line}`;
+          continue;
+        }
+        if (previous && normalizeComparable(previous) === normalizeComparable(line)) continue;
+        merged.push(line);
+      }
+      while (merged[0] === "") merged.shift();
+      while (merged[merged.length - 1] === "") merged.pop();
+      const paragraph = merged.join("\n");
+      const previousParagraph = paragraphs.length ? paragraphs[paragraphs.length - 1] : "";
+      if (
+        paragraph &&
+        normalizeComparable(previousParagraph) !== normalizeComparable(paragraph)
+      ) {
+        paragraphs.push(paragraph);
+      }
+    }
+    return paragraphs.length ? paragraphs.join("\n") : null;
+  }
+
+  function findMessageTextRoots(selectableElements) {
+    const copyable = selectableElements.filter((element) =>
+      /copyable-text/i.test(elementClassName(element))
+    );
+    const pool = copyable.length > 0 ? copyable : selectableElements;
+    const topLevel = pool.filter((element) => {
+      let parent = element.parentElement;
+      while (parent) {
+        if (selectableElements.includes(parent)) return false;
+        parent = parent.parentElement;
+      }
+      return !selectableElements.some((other) => other !== element && other.contains?.(element));
+    });
+    // Beberapa build menandai SETIAP baris sebagai copyable-text, lalu juga
+    // membungkus semuanya dalam satu copyable-text luar. Kalau ada akar yang
+    // memuat akar lain, hanya akar luar yang dipakai. Tanpa ini isi list ikut
+    // dua kali: sekali dari induk, sekali dari tiap baris.
+    return topLevel.filter(
+      (element) => !topLevel.some((other) => other !== element && other.contains(element))
+    );
+  }
+
+  function extractMessageText(metadataNode, bubble, captionOnly = false) {
+    const selectableElements = Array.from(
+      bubble.querySelectorAll(".selectable-text, .copyable-text, span[data-lexical-text='true']")
+    )
+      .filter(isVisible)
+      .filter((element) => !isQuotedOrLinkPreview(element, bubble));
+
+    const textRoots = findMessageTextRoots(selectableElements);
+    if (textRoots.length > 0) {
+      const serialized = serializeMessageElements(textRoots, bubble);
+      if (serialized) return serialized;
+    }
+
     if (captionOnly) return null;
 
-    // Fallback bila tidak ada .selectable-text: hindari menjadikan jam pesan
-    // atau nama pengirim sebagai teks. Ambil blok paling informatif (terpanjang)
-    // yang bukan sekadar jam/tanggal/nama, bukan sekadar blok terakhir.
     const nestedSelectable = Array.from(
       metadataNode.querySelectorAll("span[dir], div[dir]")
     )
@@ -5577,12 +6022,30 @@
   // pemisah dekoratif (====, ----, ****), jam/tanggal, label status pengiriman
   // (Dikirim/Delivered/Read/Sent — sering bocor dari aria-label ikon centang),
   // kata UI generik, dan label tanggal hari.
-  function isQuoteStamp(value) {
-    const key = cleanText(value)
+  // Normalisasi label UI "read more" agar tahan terhadap variasi spasi,
+  // kapitalisasi, dan titik ellipsis ("Read more", "Read  more…",
+  // "Baca selengkapnya."). Hanya cocok untuk label PERSIS, bukan isi pesan
+  // yang kebetulan memuat frasa serupa di tengah kalimat.
+  function normalizeReadMoreLabel(value) {
+    return cleanText(value)
       .toLocaleLowerCase()
       .replace(/[​‌‍﻿‎‏]/g, "")
+      .replace(/[.…]+$/g, "")
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+  function isReadMoreLabel(value) {
+    const key = normalizeReadMoreLabel(value);
+    if (!key || key.length > 64) return false;
+    return (
+      /^(?:read|show|view|see|open)\s+more$/.test(key) ||
+      /^(?:baca|lihat|tampilkan|tunjukkan|buka)\s+(?:selengkapnya|semua|lebih(?:\s+banyak)?)$/.test(key)
+    );
+  }
+
+  function isQuoteStamp(value) {
+    const key = normalizeReadMoreLabel(value);
     if (!key) return true;
     // Pemisah dekoratif: "=====", "------", "******", "_____", dsb.
     if (/^[-=*_.~•·—–]{3,}$/.test(key)) return true;
@@ -5595,7 +6058,9 @@
       "terkirim", "sending", "mengirim",
       "you", "anda", "reply", "replied", "balas", "dibalas", "meneruskan",
       "forwarded", "diteruskan", "photo", "foto", "video", "sticker", "stiker",
-      "dokumen", "document", "audio", "gif", "kontak", "contact"
+      "dokumen", "document", "audio", "gif", "kontak", "contact",
+      // Label UI pembuka pesan panjang (ellipsis sudah dipotong di normalisasi).
+      "read more", "baca selengkapnya", "lihat selengkapnya", "show more"
     ]);
     if (words.has(key)) return true;
     // Label hari/tanggal header.
@@ -5691,8 +6156,6 @@
     const imageElements = findMessageImages(bubble);
     const imageElement = imageElements[0] || null;
 
-    // URUTAN PENTING: seluruh permukaan non-gambar diperiksa lebih dulu karena
-    // video, GIF, stiker, dan kartu dokumen juga memiliki <img> poster.
     const isSkippable =
       hasVideoSurface(bubble) ||
       hasDocumentAttachment(bubble) ||
@@ -5703,13 +6166,18 @@
       /document|dokumen|attachment|lampiran/.test(labels);
 
     if (isSkippable) {
-      return { detectedAs: "skip", imageElements: [] };
+      if (hasVideoSurface(bubble)) return { detectedAs: "video", imageElements: [] };
+      if (hasDocumentAttachment(bubble) || /document|dokumen|attachment|lampiran/.test(labels)) return { detectedAs: "document", imageElements: [] };
+      if (bubble.querySelector("audio") || /voice message|voice note|pesan suara/.test(labels)) return { detectedAs: "audio", imageElements: [] };
+      if (/sticker|stiker/.test(labels)) return { detectedAs: "sticker", imageElements: [] };
+      if (/\bgif\b/.test(labels)) return { detectedAs: "gif", imageElements: [] };
+      return { detectedAs: "unknown_media", imageElements: [] };
     }
 
     // findMessageImages() sudah membuang thumbnail di dalam kartu preview,
     // sehingga sisa kandidat di sini adalah foto asli.
     if (hasLinkPreview(bubble) && !imageElement) {
-      return { detectedAs: "skip", imageElements: [] };
+      return { detectedAs: "link_preview", imageElements: [] };
     }
 
     if (!imageElement) {
@@ -5759,13 +6227,23 @@
     const unique = [];
     for (const element of candidates) {
       const rect = element.getBoundingClientRect();
+      let source = "";
+      if (element instanceof HTMLImageElement) source = element.currentSrc || element.getAttribute("src") || "";
+      else source = extractBackgroundImageUrl(element);
+
       const duplicate = unique.findIndex((other) => {
+        let otherSource = "";
+        if (other instanceof HTMLImageElement) otherSource = other.currentSrc || other.getAttribute("src") || "";
+        else otherSource = extractBackgroundImageUrl(other);
+
+        if (source && otherSource && source === otherSource) return true;
+
         const otherRect = other.getBoundingClientRect();
         // Placeholder/canvas dan img bisa berupa sibling yang saling menimpa.
-        return Math.abs(rect.left - otherRect.left) < 3 &&
-          Math.abs(rect.top - otherRect.top) < 3 &&
-          Math.abs(rect.width - otherRect.width) < 3 &&
-          Math.abs(rect.height - otherRect.height) < 3;
+        return Math.abs(rect.left - otherRect.left) < 5 &&
+          Math.abs(rect.top - otherRect.top) < 5 &&
+          Math.abs(rect.width - otherRect.width) < 5 &&
+          Math.abs(rect.height - otherRect.height) < 5;
       });
       if (duplicate < 0) unique.push(element);
       else if (imageArea(element) > imageArea(unique[duplicate])) unique[duplicate] = element;
@@ -5895,9 +6373,14 @@
   // Hanya dua tipe yang diekspor: "img" dan "text". null berarti bubble tidak
   // menghasilkan apa pun dan harus dilewati oleh pemanggil.
   function detectMessageType(text, media) {
-    if (media?.detectedAs === "image") {
-      return "img";
-    }
+    if (media?.detectedAs === "image") return "img";
+    if (media?.detectedAs === "video") return "video";
+    if (media?.detectedAs === "document") return "document";
+    if (media?.detectedAs === "audio") return "audio";
+    if (media?.detectedAs === "sticker") return "sticker";
+    if (media?.detectedAs === "gif") return "gif";
+    if (media?.detectedAs === "unknown_media") return text ? "text" : "unknown_media";
+    if (media?.detectedAs === "link_preview") return text ? "text" : "link_preview";
 
     // Media non-gambar hanya menyumbang caption teks aslinya, bila ada.
     return text ? "text" : null;
@@ -5921,20 +6404,27 @@
 
   function extractReplyPreview(bubble, messageText, currentMessageId = null) {
     const messageKey = normalizeComparable(messageText || "");
-    // Quoted reply HANYA boleh berasal dari elemen yang terkonfirmasi berada di
-    // dalam kontainer quote/balasan (penanda quoted-*, blockquote, atau label
-    // Dikutip/Balasan/Reply). Pendekatan lama menganggap SETIAP blok teks lain
-    // di dalam bubble sebagai quote; akibatnya pesan panjang yang dirender
-    // sebagai beberapa blok dipecah dan blok awalnya disalahartikan sebagai
-    // reply terhadap pesan itu sendiri (sender/message_id/sequence = null).
-    const quotedElements = Array.from(bubble.querySelectorAll(".selectable-text"))
+    let quotedElements = Array.from(bubble.querySelectorAll(".selectable-text, .copyable-text, span[data-lexical-text='true']"))
       .filter(isVisible)
       .filter((element) => isQuotedOrLinkPreview(element, bubble));
+
+    // Fallback: Jika selector di atas tidak menemukan teks (perubahan DOM WhatsApp),
+    // cari elemen teks utama di dalam kontainer quote.
+    if (quotedElements.length === 0) {
+      const quoteContainers = Array.from(bubble.querySelectorAll('blockquote, [data-testid*="quoted"], [class*="quoted"], [class*="quoted-mention"], [class*="link-preview"], [class*="url-preview"]'))
+        .filter(isRealQuoteContainer);
+      for (const container of quoteContainers) {
+        if (!bubble.contains(container)) continue;
+        const fallbackElements = Array.from(container.querySelectorAll("span[dir], div[dir]")).filter(isVisible);
+        quotedElements.push(...fallbackElements);
+      }
+    }
 
     const candidates = [];
     const seen = new Set();
     for (const element of quotedElements) {
-      const text = cleanText(element.innerText);
+      let text = cleanText(element.innerText);
+      if (!text) text = cleanText(element.textContent);
       const key = normalizeComparable(text);
       if (!key || key === messageKey || seen.has(key)) continue;
       seen.add(key);
@@ -6179,9 +6669,25 @@
     return "unknown";
   }
 
+  function messageFingerprint(message) {
+    return [
+      normalizeComparable(message?.sender || ""),
+      message?.timestamp_iso || "",
+      message?.direction || "",
+      message?.type || "",
+      normalizeComparable(message?.text || "")
+    ].join("|");
+  }
+
   function messageQuality(message) {
     let score = 0;
-    if (message.text) score += 4;
+    if (message.text) {
+      score += 4;
+      // Versi terpotong ("Read more" belum diklik) dan versi utuh memakai ID
+      // yang sama. Skor lama hanya memberi +4 selama ada teks, sehingga potongan
+      // pendek yang terkumpul lebih dulu MENANG dan teks lengkap dibuang.
+      score += Math.min(message.text.length, 200_000);
+    }
     if (message.timestamp_iso) score += 2;
     if (message.sender) score += 1;
     if (message.direction !== "unknown") score += 1;
@@ -6243,7 +6749,10 @@
 
   function cleanText(value) {
     return String(value || "")
-      .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
+      // Hapus karakter tak-terlihat murni (zero-width space/non-joiner, BOM).
+      // ZWJ (\u200d) DIPERTAHANKAN: ia menyusun emoji kombinasi (👨‍💻, keluarga,
+      // bendera) dan font unicode; menghapusnya merusak konten pesan asli.
+      .replace(/[\u200b\u200c\ufeff]/g, "")
       .replace(/\r/g, "")
       .replace(/[ \t]+/g, " ")
       .replace(/\n{3,}/g, "\n\n")
