@@ -152,7 +152,11 @@ JSON hasil ekspor hanya pernah memuat `"type": "img"` atau `"type": "text"`. Bub
 
 ### Perbaikan jam terbaca sebagai teks
 
-Sebelumnya mode `captionOnly` hanya aktif untuk video dan gambar, sehingga stiker/voice note jatuh ke fallback `span[dir]` dan memungut jam pesan (mis. `"22:47"`) sebagai `text`. Sekarang **semua** bubble bermedia memakai `captionOnly`, jadi hanya caption asli yang dibaca. Durasi video dan jam pesan tidak pernah menjadi caption.
+Sebelumnya mode `captionOnly` hanya aktif untuk video dan gambar, sehingga stiker/voice note jatuh ke fallback `span[dir]` dan memungut jam pesan (mis. `"22:47"`) sebagai `text`. Sekarang **semua** bubble bermedia memakai `captionOnly`, jadi hanya caption asli yang dibaca. Untuk pesan teks biasa, baris jam terakhir juga dibuang hanya bila nilainya persis sama dengan jam pada `timestamp_raw`; jam lain yang memang merupakan isi pesan tetap dipertahankan.
+
+### Timestamp JSON
+
+JSON tidak memiliki tipe tanggal bawaan. Karena itu `timestamp_raw` dan `timestamp_iso` tetap berupa string yang mudah dibaca dan kompatibel dengan ekspor lama. Setiap pesan sekarang juga memiliki `timestamp_unix_ms` bertipe **number** (Unix epoch millisecond), sehingga aplikasi pembaca dapat mengurutkan atau mengolah waktu tanpa membaca tanggal sebagai teks.
 
 ### Pesan panjang multi-blok & deteksi reply yang akurat
 
@@ -160,8 +164,8 @@ WhatsApp Web merender satu pesan panjang sebagai beberapa blok teks di dalam bub
 
 - **Satu pesan = satu `text` utuh.** Seluruh blok milik bubble digabung (urutan DOM) menjadi satu string, bukan hanya blok terakhir. Pemformatan unik WhatsApp — bold, italic, strikethrough, monospace, quote-line, bullet, emoji, font unicode — dipertahankan apa adanya.
 - **Kartu quote divalidasi secara struktural**, bukan hanya dari nama class. Bubble pesan panjang kadang memiliki class yang kebetulan mengandung kata "quoted" (CSS-in-JS hash/komponen UI lain). Kontainer seperti itu hanya dipercaya sebagai quote bila benar-benar memuat preview teks/media/stempel waktu; kalau tidak, dianggap elemen biasa sehingga teks pesan tidak pernah ikut terhapus.
-- **Reply palsu dibuang.** Setelah sequence final dihitung, kandidat `reply_to` yang tidak memiliki `message_id` DOM **dan** tidak cocok dengan pesan mana pun sebelumnya dianggap false-positive lalu dihapus (`reply_to: null`), bukan disimpan dengan sequence kosong.
-- **`reply_to.sequence` berisi sequence asli.** Pesan dengan sequence 9 yang me-reply pesan sequence 4 akan tercatat dengan `reply_to.sequence = 4` (dan `message_id` pesan target), selama pesan target ikut terekspor. Pencocokan tahan terhadap preview yang dipotong WhatsApp (≤500 karakter) karena memakai kecocokan prefix/isi.
+- **Reply nyata tidak dibuang saat target berada di luar ekspor.** Setelah kartu quote lolos validasi struktural/semantik, `reply_to.sender` dan `reply_to.preview` tetap disimpan. Jika pesan target tidak ikut terekspor atau ID-nya tidak tersedia, `message_id` dan `sequence` bernilai `null`.
+- **`reply_to.sequence` berisi sequence asli.** Pesan dengan sequence 9 yang me-reply pesan sequence 4 akan tercatat dengan `reply_to.sequence = 4` (dan `message_id` pesan target), selama pesan target ikut terekspor. Resolver membandingkan preview dengan seluruh pesan sebelumnya, memberi skor pada exact/prefix dan kata-kata berurutan, lalu memakai sender sebagai penguat. Pencocokan tahan terhadap preview yang dipotong WhatsApp, kata/baris tambahan pada body asli, serta perbedaan marker format dan tanda baca. Jika dua kandidat sama kuat, sequence tetap `null` agar tidak menunjuk pesan yang salah.
 - **Label status bukan pengirim.** Label pengiriman seperti `Dikirim`/`Delivered` yang bocor dari aria-label ikon centang tidak pernah dicatat sebagai `reply_to.sender`; hanya nama pengirim asli di dalam kartu quote yang dipakai.
 
 - Foto tanpa caption dan tanpa ID native memakai ID sementara per bubble, bukan hash caption kosong, supaya dua foto berbeda tidak saling menimpa dalam antrean. Baris pesan (`role="row"`) berisi media juga diperiksa jika class pesan/metadata tidak tersedia. Untuk pesan tanpa ID native, DOM yang dibuat ulang dapat menghasilkan ID sementara baru; deduplikasi byte file tetap berlaku, tetapi deduplikasi record pesan pada kondisi ini tidak dijamin.

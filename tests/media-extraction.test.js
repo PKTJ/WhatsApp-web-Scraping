@@ -164,6 +164,7 @@ function setup(extraNames = []) {
     'extractMessageText', 'isQuotedOrLinkPreview', 'extractMessageUrls', 'hasLinkPreview',
     'detectMedia', 'registerImageCandidate', 'imageCandidateSignature',
     'hasDocumentAttachment', 'hasVideoSurface', 'isLikelyTimestampOrNameOnly',
+    'normalizeStandaloneClock', 'stripTrailingMessageTimestamp',
     'isQuoteStamp', 'quoteEvidenceSelector', 'quoteContainerEvidenceScore', 'isRealQuoteContainer',
     'normalizeReadMoreLabel', 'isReadMoreLabel', 'messageQuality',
     'elementClassName', 'isMessageBlockElement', 'isListMarkerText', 'joinInlinePieces',
@@ -173,8 +174,9 @@ function setup(extraNames = []) {
     'buildChatJsonFilename', 'buildChatJsonPayload', 'buildExportSummaryJson', 'sanitizeChatForJson',
     'findRenderedMessageRoots', 'collectRenderedMessages', 'imageCandidateScore',
     'resolveReplySequences', 'findReplyTargetByPreview', 'isGenericMediaReplyPreview',
-    'replySenderMatches', 'normalizeReplyComparable', 'replyPreviewMatchesMessage',
-    'replyPreviewMatchesMediaType'];
+    'replySenderMatches', 'normalizeReplyComparable', 'replyOrderedTokenCoverage',
+    'replyPreviewMatchScore', 'replyPreviewMatchesMessage',
+    'replyPreviewMatchesMediaType', 'isoTimestampToUnixMs'];
   for (const name of [...names, ...extraNames]) {
     let start = source.indexOf(`  function ${name}(`);
     if (start < 0) start = source.indexOf(`  async function ${name}(`);
@@ -247,7 +249,9 @@ function multiBlockBubble(blocks, images = []) {
   // kandidat nama pengirim di dalamnya (dipakai extractReplySender).
   quoteContainer.nodes = { '.selectable-text': quotedElements, 'span, div': spans };
   root.nodes['.selectable-text'] = selectable;
-  // Daftarkan kontainer quoted agar extractReplySender dapat menemukannya.
+  // Daftarkan kontainer quoted agar parser menemukannya pada selector lama
+  // maupun selector reply modern yang lebih luas.
+  root.nodes['[class*="quoted"]'] = blocks.some((b) => b.quoted) ? [quoteContainer] : [];
   root.nodes['[class*="quoted"], blockquote, [data-testid*="quoted"]'] =
     blocks.some((b) => b.quoted) ? [quoteContainer] : [];
   root.nodes['span, div'] = selectable.concat(spans);
@@ -262,6 +266,7 @@ function multiBlockBubble(blocks, images = []) {
 function addStrayQuotedElement(root, selectable) {
   const stray = new Element(0, root);
   stray.attrs.class = 'x1quoted0f9k btn';
+  root.nodes['[class*="quoted"]'] = [stray];
   root.nodes['[class*="quoted"], blockquote, [data-testid*="quoted"]'] = [stray];
   for (const el of selectable) {
     // closest() mengembalikan elemen liar ini untuk SEMUA blok pesan.
@@ -819,6 +824,69 @@ test('a real quoted reply keeps quoted text out of the body and links the previe
   assert.equal(message.reply_to.sender, 'Pusdalyan A');
 });
 
+test('timestamp is also exported as a JSON number in Unix milliseconds', () => {
+  const message = setup().parseMessageNode(bubble([], 'Pesan bertimestamp'), 0);
+  assert.equal(typeof message.timestamp_unix_ms, 'number');
+  assert.equal(message.timestamp_unix_ms, Date.parse('2026-04-01T10:00:00'));
+  // Dua field lama dipertahankan agar format ekspor tetap kompatibel.
+  assert.equal(message.timestamp_raw, '10:00, 01/04/2026');
+  assert.equal(message.timestamp_iso, '2026-04-01T10:00:00');
+});
+
+test('per-chat JSON serializes timestamp_unix_ms as a number', () => {
+  const api = setup();
+  const message = api.parseMessageNode(bubble([], 'Pesan bertimestamp'), 0);
+  const payload = api.buildChatJsonPayload({
+    payload: { schema_version: '1.9.2' },
+    chat: { chat_name: 'Halo', messages: [message] },
+    relativePath: 'messages/Halo.json'
+  });
+  const exported = JSON.parse(JSON.stringify(payload));
+  assert.equal(typeof exported.chat.messages[0].timestamp_unix_ms, 'number');
+  assert.equal(exported.chat.messages[0].timestamp_unix_ms, message.timestamp_unix_ms);
+});
+
+test('modern data-testid reply card is extracted without mixing preview into body', () => {
+  const api = setup();
+  const root = new Element();
+  const replyContainer = new Element(0, root);
+  replyContainer.attrs['data-testid'] = 'quoted-message-reply';
+
+  const sender = new Element(0, replyContainer, 'SPAN');
+  sender.attrs.dir = 'auto';
+  sender.innerText = 'Anda';
+  const preview = new Element(1, replyContainer, 'SPAN');
+  preview.attrs.dir = 'auto';
+  preview.innerText = 'Assalamualaikum Wr Wb, Berikut Kami Sampaikan Laporan Pengendalian ...';
+  preview.textContent = preview.innerText;
+  preview.excluded = replyContainer;
+  preview.excludedMatch = 'data-testid*="reply"';
+
+  replyContainer.nodes = {
+    'span[dir]': [sender, preview],
+    'span, div': [sender, preview]
+  };
+
+  const body = new Element(2, root);
+  body.className = 'selectable-text copyable-text';
+  body.innerText = 'Gambar Di Figma';
+  textLeaves(body, body.innerText);
+  body.closest = () => null;
+
+  root.nodes = {
+    '.selectable-text': [body],
+    '[data-testid*="reply"]': [replyContainer],
+    'span, div': [sender, preview, body]
+  };
+
+  const message = api.parseMessageNode(root, 0);
+  assert.equal(message.text, 'Gambar Di Figma');
+  assert.ok(message.reply_to);
+  assert.equal(message.reply_to.sender, 'Anda');
+  assert.equal(message.reply_to.preview,
+    'Assalamualaikum Wr Wb, Berikut Kami Sampaikan Laporan Pengendalian ...');
+});
+
 test('duplicate adjacent blocks in one message are merged without repetition', () => {
   const api = setup();
   const root = multiBlockBubble([
@@ -984,6 +1052,29 @@ test('longer expanded text replaces the truncated read-more capture', () => {
 
 
 
+test('matching trailing bubble timestamp is removed from message text only', () => {
+  const api = setup();
+  api.parsePrePlainText = () => ({
+    sender: 'Ajrun Kabirun',
+    timestampRaw: '03:49, 10/3/2026',
+    timestampIso: '2026-03-10T03:49:00+07:00'
+  });
+
+  const leaked = api.parseMessageNode(bubble([], [
+    '2. Pesan Terlalu Panjang menyebabkan banyak pesan yang hilang',
+    '03:49'
+  ].join('\n')), 0);
+  assert.equal(leaked.text,
+    '2. Pesan Terlalu Panjang menyebabkan banyak pesan yang hilang');
+
+  // Jam berbeda dapat merupakan isi pesan yang sah dan tidak boleh dihapus.
+  const legitimate = api.parseMessageNode(bubble([], [
+    'Keberangkatan berikutnya',
+    '04:00'
+  ].join('\n')), 1);
+  assert.equal(legitimate.text, 'Keberangkatan berikutnya\n04:00');
+});
+
 test('clock-only nested fallback is not captured as message text', () => {
   const api = setup();
   const root = bubble([], null);
@@ -1034,25 +1125,124 @@ test('reply sequence resolves to the real original message sequence', () => {
   assert.equal(entry.reply_to.message_id, 'm4');
 });
 
-test('a fake reply is dropped when its preview matches no earlier message', () => {
+test('reply sequence resolves when quoted preview drops formatting and ends mid-word', () => {
   const api = setup(['resolveReplySequences']);
-  // Bubble yang menghasilkan reply_to palsu: preview "Informasi Pusdalyan..."
-  // tidak pernah muncul sebagai pesan mana pun di riwayat chat.
-  const fakeRoot = multiBlockBubble([
+  const originalText = [
+    '*Assalamualaikum Wr Wb,*',
+    '_Berikut Kami Sampaikan Laporan Pengendalian Perjalanan KA 123 tujuan Bandung._',
+    '*Pusdalyan Proaktif, Responsif dan Solutif*'
+  ].join('\n');
+  const preview = 'Assalamualaikum Wr Wb,\nBerikut Kami Sampaikan Laporan Pengendalian P...';
+  const replyRoot = multiBlockBubble([
+    { text: preview, quoted: true, sender: 'Ajrun Kabirun' },
+    { text: '2. Pesan Terlalu Panjang menyebabkan banyak pesan yang hilang' }
+  ]);
+  const replyMessage = api.parseMessageNode(replyRoot, 8);
+  const messages = [
+    { id: 'm1', sender: 'A', direction: 'incoming', type: 'text', text: 'Pesan lain 1' },
+    { id: 'm2', sender: 'B', direction: 'incoming', type: 'text', text: 'Pesan lain 2' },
+    { id: 'm3', sender: 'A', direction: 'incoming', type: 'text', text: 'Pesan lain 3' },
+    { id: 'm4', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text', text: originalText },
+    { id: 'm5', sender: 'A', direction: 'incoming', type: 'text', text: 'Pesan lain 5' },
+    { id: 'm6', sender: 'B', direction: 'incoming', type: 'text', text: 'Pesan lain 6' },
+    { id: 'm7', sender: 'A', direction: 'incoming', type: 'text', text: 'Pesan lain 7' },
+    { id: 'm8', sender: 'B', direction: 'incoming', type: 'text', text: 'Pesan lain 8' }
+  ].map((message, index) => ({ ...message, sequence: index + 1, reply_to: null }));
+  messages.push({ ...replyMessage, sequence: 9 });
+
+  const resolved = api.resolveReplySequences(messages);
+  assert.equal(resolved[8].reply_to.sequence, 4);
+  assert.equal(resolved[8].reply_to.message_id, 'm4');
+});
+
+test('reply resolver ranks all earlier messages and selects the strongest content match', () => {
+  const api = setup(['resolveReplySequences']);
+  const preview = 'Assalamualaikum Wr Wb Berikut Kami Sampaikan Laporan Pengendalian Perjalanan KA 123';
+  const messages = [
+    { id: 'm1', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text',
+      text: 'Assalamualaikum Wr Wb\nBerikut Kami Sampaikan informasi umum perjalanan KA lain' },
+    { id: 'm2', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text',
+      text: 'Informasi Pusdalyan\nAssalamualaikum Wr Wb\nBerikut Kami Sampaikan Laporan terbaru Pengendalian Perjalanan KA 123 tujuan Bandung' },
+    { id: 'm3', sender: 'B', direction: 'incoming', type: 'text', text: 'Pesan lain' },
+    { id: 'm4', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text', text: 'Pesan yang mereply',
+      reply_to: { sender: 'Ajrun Kabirun', preview, message_id: null, sequence: null } }
+  ].map((message, index) => ({
+    ...message,
+    sequence: index + 1,
+    reply_to: message.reply_to || null
+  }));
+
+  const resolved = api.resolveReplySequences(messages);
+  assert.equal(resolved[3].reply_to.sequence, 2);
+  assert.equal(resolved[3].reply_to.message_id, 'm2');
+});
+
+test('reply resolver uses quoted sender to disambiguate identical message text', () => {
+  const api = setup(['resolveReplySequences']);
+  const repeated = 'Assalamualaikum Wr Wb Berikut Kami Sampaikan Laporan Pengendalian Perjalanan KA 123';
+  const messages = [
+    { id: 'm1', sender: 'Pengirim Lain', direction: 'incoming', type: 'text', text: repeated },
+    { id: 'm2', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text', text: repeated },
+    { id: 'm3', sender: 'B', direction: 'incoming', type: 'text', text: 'Balasan',
+      reply_to: { sender: 'Ajrun Kabirun', preview: repeated, message_id: null, sequence: null } }
+  ].map((message, index) => ({
+    ...message,
+    sequence: index + 1,
+    reply_to: message.reply_to || null
+  }));
+
+  const resolved = api.resolveReplySequences(messages);
+  assert.equal(resolved[2].reply_to.sequence, 2);
+  assert.equal(resolved[2].reply_to.message_id, 'm2');
+});
+
+test('reply resolver keeps sequence null when equally strong targets are ambiguous', () => {
+  const api = setup(['resolveReplySequences']);
+  const repeated = 'Assalamualaikum Wr Wb Berikut Kami Sampaikan Laporan Pengendalian Perjalanan KA 123';
+  const messages = [
+    { id: 'm1', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text', text: repeated },
+    { id: 'm2', sender: 'Ajrun Kabirun', direction: 'incoming', type: 'text', text: repeated },
+    { id: 'm3', sender: 'B', direction: 'incoming', type: 'text', text: 'Balasan',
+      reply_to: { sender: 'Ajrun Kabirun', preview: repeated, message_id: null, sequence: null } }
+  ].map((message, index) => ({
+    ...message,
+    sequence: index + 1,
+    reply_to: message.reply_to || null
+  }));
+
+  const resolved = api.resolveReplySequences(messages);
+  assert.equal(resolved[2].reply_to.sequence, null);
+  assert.equal(resolved[2].reply_to.message_id, null);
+});
+
+test('reply normalization does not turn a short generic preview into a match', () => {
+  const api = setup(['replyPreviewMatchesMessage']);
+  assert.equal(api.replyPreviewMatchesMessage('laporan', {
+    type: 'text',
+    text: '*Laporan* perjalanan lengkap menuju Bandung'
+  }), false);
+});
+
+test('a structurally confirmed reply remains when its target is outside the export range', () => {
+  const api = setup(['resolveReplySequences']);
+  const replyRoot = multiBlockBubble([
     { text: 'Informasi Pusdalyan 2 Oktober 2026 03:11 PENUMPANG MELEBIHI RELASI', quoted: true },
     { text: 'Semakin Melayani' }
   ]);
-  const fakeMessage = api.parseMessageNode(fakeRoot, 2);
-  assert.ok(fakeMessage.reply_to, 'parse menghasilkan kandidat reply');
+  const replyMessage = api.parseMessageNode(replyRoot, 2);
+  assert.ok(replyMessage.reply_to, 'kartu reply nyata harus terbaca dari DOM');
   const messages = [
     { id: 'm1', sender: 'A', direction: 'incoming', type: 'text', text: 'Halo selamat pagi' },
     { id: 'm2', sender: 'B', direction: 'outgoing', type: 'text', text: 'Pagi, siap' }
   ].map((message, index) => ({ ...message, sequence: index + 1, reply_to: null }));
-  messages.push({ ...fakeMessage, sequence: 3 });
+  messages.push({ ...replyMessage, sequence: 3 });
   const resolved = api.resolveReplySequences(messages);
-  // Tidak ada pesan yang cocok -> reply palsu dibuang, bukan disimpan dengan
-  // sequence null.
-  assert.equal(resolved[2].reply_to, null);
+
+  assert.ok(resolved[2].reply_to, 'reply_to tidak boleh hilang hanya karena target tidak terekspor');
+  assert.equal(resolved[2].reply_to.preview,
+    'Informasi Pusdalyan 2 Oktober 2026 03:11 PENUMPANG MELEBIHI RELASI');
+  assert.equal(resolved[2].reply_to.message_id, null);
+  assert.equal(resolved[2].reply_to.sequence, null);
 });
 
 test('a reply to a long message still resolves despite the 500-char preview cut', () => {

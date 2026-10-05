@@ -3647,6 +3647,9 @@
         sender: publicMessage.sender,
         timestamp_raw: publicMessage.timestamp_raw,
         timestamp_iso: publicMessage.timestamp_iso,
+        // JSON tidak memiliki tipe Date. Sediakan epoch millisecond bertipe
+        // number agar consumer tidak perlu memperlakukan waktu sebagai teks.
+        timestamp_unix_ms: isoTimestampToUnixMs(publicMessage.timestamp_iso),
         direction: publicMessage.direction,
         type: publicMessage.type,
         text: publicMessage.text,
@@ -4165,7 +4168,8 @@
     // sehingga stiker/voice note jatuh ke fallback span[dir] dan menangkap jam
     // pesan ("22:47") sebagai teks. Sekarang SEMUA bubble bermedia memakai
     // captionOnly, jadi hanya caption asli yang diambil.
-    const text = extractMessageText(metadataNode, bubble, Boolean(media));
+    const extractedText = extractMessageText(metadataNode, bubble, Boolean(media));
+    const text = stripTrailingMessageTimestamp(extractedText, parsedMetadata.timestampRaw);
     const type = detectMessageType(text, media, bubble);
 
     // Media di luar gambar tidak diekspor. Tanpa caption, tidak ada yang
@@ -4206,6 +4210,7 @@
       sender: parsedMetadata.sender,
       timestamp_raw: parsedMetadata.timestampRaw,
       timestamp_iso: parsedMetadata.timestampIso,
+      timestamp_unix_ms: isoTimestampToUnixMs(parsedMetadata.timestampIso),
       direction,
       type,
       text: text || null,
@@ -5572,6 +5577,12 @@
     };
   }
 
+  function isoTimestampToUnixMs(value) {
+    if (!value) return null;
+    const milliseconds = new Date(value).getTime();
+    return Number.isFinite(milliseconds) ? milliseconds : null;
+  }
+
   function parseLocalizedTimestamp(value) {
     const cleaned = value.replace(/[\u200e\u200f]/g, "").trim();
     const match = cleaned.match(
@@ -6018,6 +6029,31 @@
     return false;
   }
 
+  function normalizeStandaloneClock(value) {
+    const match = cleanText(value).match(/^(\d{1,2})[:.](\d{2})(?:\s*(am|pm))?$/i);
+    if (!match) return null;
+    return `${Number(match[1])}:${match[2]}${(match[3] || "").toLowerCase()}`;
+  }
+
+  function stripTrailingMessageTimestamp(text, timestampRaw) {
+    const cleaned = cleanText(text);
+    if (!cleaned || !timestampRaw) return cleaned || null;
+
+    const lines = cleaned.split("\n");
+    // Jangan menghapus pesan yang memang hanya berisi sebuah jam.
+    if (lines.length < 2) return cleaned;
+
+    const metadataClockMatch = cleanText(timestampRaw).match(
+      /^(\d{1,2}[:.]\d{2}(?:\s*(?:am|pm))?)(?=\s*,|$)/i
+    );
+    const metadataClock = normalizeStandaloneClock(metadataClockMatch?.[1]);
+    const trailingClock = normalizeStandaloneClock(lines[lines.length - 1]);
+    if (!metadataClock || trailingClock !== metadataClock) return cleaned;
+
+    lines.pop();
+    return cleanText(lines.join("\n")) || null;
+  }
+
   // Stempel visual di dalam SATU pesan yang tidak pernah menjadi isi quote:
   // pemisah dekoratif (====, ----, ****), jam/tanggal, label status pengiriman
   // (Dikirim/Delivered/Read/Sent — sering bocor dari aria-label ikon centang),
@@ -6269,7 +6305,7 @@
     //   - KELAS "quoted": hanya dipercaya jika kontainernya lolos validasi
     //     struktural sebagai kartu quote (memuat teks/media/stempel nyata).
     const strictContainer = element.closest(
-      'blockquote, [data-testid*="quoted"], ' +
+      'blockquote, [data-testid*="quoted"], [data-testid*="reply"], ' +
       '[class*="link-preview"], [class*="url-preview"], ' +
       '[aria-label*="Quoted" i], [aria-label*="Dikutip" i], ' +
       '[aria-label*="Balasan" i], [aria-label*="Membalas" i], [aria-label*="Replying" i], ' +
@@ -6374,15 +6410,12 @@
   // menghasilkan apa pun dan harus dilewati oleh pemanggil.
   function detectMessageType(text, media) {
     if (media?.detectedAs === "image") return "img";
-    if (media?.detectedAs === "video") return "video";
-    if (media?.detectedAs === "document") return "document";
-    if (media?.detectedAs === "audio") return "audio";
-    if (media?.detectedAs === "sticker") return "sticker";
-    if (media?.detectedAs === "gif") return "gif";
-    if (media?.detectedAs === "unknown_media") return text ? "text" : "unknown_media";
-    if (media?.detectedAs === "link_preview") return text ? "text" : "link_preview";
 
-    // Media non-gambar hanya menyumbang caption teks aslinya, bila ada.
+    // Hanya dua tipe yang pernah diekspor: "img" dan "text". Semua media
+    // non-gambar (video, dokumen, stiker, voice note, GIF, link preview) HANYA
+    // menyumbang caption teks aslinya. Tanpa caption tidak ada yang bisa
+    // diekspor sehingga bubble harus dilewati (null) — sebelumnya tipe
+    // "video"/"document"/"sticker" bocor ke JSON sebagai record kosong.
     return text ? "text" : null;
   }
 
@@ -6404,18 +6437,30 @@
 
   function extractReplyPreview(bubble, messageText, currentMessageId = null) {
     const messageKey = normalizeComparable(messageText || "");
-    let quotedElements = Array.from(bubble.querySelectorAll(".selectable-text, .copyable-text, span[data-lexical-text='true']"))
-      .filter(isVisible)
-      .filter((element) => isQuotedOrLinkPreview(element, bubble));
+    const quoteContainers = Array.from(bubble.querySelectorAll(
+      'blockquote, [data-testid*="quoted"], [data-testid*="reply"], ' +
+      '[class*="quoted"], [class*="quoted-mention"], ' +
+      '[aria-label*="Quoted" i], [aria-label*="Dikutip" i], ' +
+      '[aria-label*="Balasan" i], [aria-label*="Membalas" i], [aria-label*="Replying" i]'
+    ))
+      .filter((container) => bubble.contains(container))
+      .filter(isRealQuoteContainer);
 
-    // Fallback: Jika selector di atas tidak menemukan teks (perubahan DOM WhatsApp),
-    // cari elemen teks utama di dalam kontainer quote.
+    // Jangan gunakan isQuotedOrLinkPreview() di sini: fungsi tersebut sengaja
+    // juga mengenali kartu tautan untuk penyaringan body/media. reply_to hanya
+    // boleh berasal dari kontainer quote/reply yang tervalidasi.
+    let quotedElements = Array.from(
+      bubble.querySelectorAll(".selectable-text, .copyable-text, span[data-lexical-text='true']")
+    )
+      .filter(isVisible)
+      .filter((element) => quoteContainers.some((container) => container.contains(element)));
+
+    // Build WhatsApp tertentu tidak memakai selectable-text di kartu reply.
     if (quotedElements.length === 0) {
-      const quoteContainers = Array.from(bubble.querySelectorAll('blockquote, [data-testid*="quoted"], [class*="quoted"], [class*="quoted-mention"], [class*="link-preview"], [class*="url-preview"]'))
-        .filter(isRealQuoteContainer);
       for (const container of quoteContainers) {
-        if (!bubble.contains(container)) continue;
-        const fallbackElements = Array.from(container.querySelectorAll("span[dir], div[dir]")).filter(isVisible);
+        const fallbackElements = Array.from(
+          container.querySelectorAll("span[dir], div[dir]")
+        ).filter(isVisible);
         quotedElements.push(...fallbackElements);
       }
     }
@@ -6435,12 +6480,22 @@
       return null;
     }
 
+    // Cari sender dari seluruh teks kartu terlebih dahulu. Pada build modern,
+    // label sender (mis. "Anda") dapat sama-sama memakai span[dir]; hapus hanya
+    // kandidat sender pertama bila masih ada kandidat preview lain.
+    const combinedPreview = candidates.join("\n");
+    const sender = extractReplySender(bubble, combinedPreview, messageText);
+    const senderKey = normalizeComparable(sender || "");
+    const previewCandidates = candidates.length > 1 && senderKey
+      ? candidates.filter((text, index) =>
+        index > 0 || normalizeComparable(text) !== senderKey)
+      : candidates;
+
     // Gabungkan seluruh blok quote (urutan DOM) agar isi pesan yang dibalas
     // tidak terpotong sama seperti perbaikan pada body pesan.
-    const preview = candidates.join("\n");
+    const preview = previewCandidates.join("\n");
     if (!preview) return null;
 
-    const sender = extractReplySender(bubble, preview, messageText);
     const quotedMessageId = extractQuotedMessageId(bubble, currentMessageId);
 
     return {
@@ -6464,7 +6519,8 @@
       const match = label.match(/(?:replying to|reply to|membalas|balas ke)\s+(.+)/i);
       if (match?.[1]) {
         const value = cleanText(match[1]).replace(/[,:].*$/, "");
-        if (value && !isQuoteStamp(value)) return value.slice(0, 160);
+        const isSelfLabel = /^(you|anda|saya|me)$/i.test(value);
+        if (value && (!isQuoteStamp(value) || isSelfLabel)) return value.slice(0, 160);
       }
     }
 
@@ -6477,18 +6533,21 @@
       normalizeComparable(preview || ""),
       normalizeComparable(messageText || "")
     ]);
-    const quoteContainer = Array.from(
-      bubble.querySelectorAll('[class*="quoted"], blockquote, [data-testid*="quoted"]')
-    ).find(isRealQuoteContainer) || null;
+    const quoteContainer = Array.from(bubble.querySelectorAll(
+      '[class*="quoted"], blockquote, [data-testid*="quoted"], [data-testid*="reply"], ' +
+      '[aria-label*="Quoted" i], [aria-label*="Dikutip" i], ' +
+      '[aria-label*="Balasan" i], [aria-label*="Membalas" i], [aria-label*="Replying" i]'
+    )).find(isRealQuoteContainer) || null;
     const scope = quoteContainer || bubble;
     const nameCandidate = Array.from(scope.querySelectorAll("span, div"))
       .filter(isVisible)
       .map((element) => cleanText(element.innerText))
       .filter((text) => {
         const key = normalizeComparable(text);
+        const isSelfLabel = /^(you|anda|saya|me)$/.test(key);
         return key && key.length >= 2 && key.length <= 60 && !excluded.has(key) &&
           !isLikelyTimestampOrNameOnly(text) && !isLikelySidebarMetadata(text) &&
-          !isQuoteStamp(text);
+          (!isQuoteStamp(text) || isSelfLabel);
       })
       .find((text) => /[\p{L}]/u.test(text) && text.length <= 60);
 
@@ -6519,15 +6578,11 @@
         target = findReplyTargetByPreview(messages, index, reply);
       }
 
-      // Validasi silang: jika tidak ada message_id DOM DAN tidak ada pesan
-      // sebelumnya yang cocok dengan preview, kandidat reply ini hampir pasti
-      // FALSE-POSITIVE (mis. potongan pesan panjang yang salah diklasifikasikan
-      // sebagai quote). Buang seluruhnya agar tidak menghasilkan entri reply
-      // palsu dengan sender/message_id/sequence null — persis bug "pesan dianggap
-      // reply terhadap dirinya sendiri".
-      if (!target && !reply.message_id) {
-        return { ...message, reply_to: null };
-      }
+      // extractReplyPreview() hanya menghasilkan kandidat dari kartu quote yang
+      // terkonfirmasi secara struktural/semantik. Jangan menghapus kartu nyata
+      // hanya karena target berada di luar batas ekspor atau sudah tidak dirender
+      // WhatsApp. Dalam kondisi itu preview/sender tetap berguna, sedangkan
+      // message_id dan sequence dibiarkan null.
 
       // Target nyata ditemukan -> cantumkan sequence ASLI pesan tersebut.
       // (Mis. pesan sequence 9 me-reply pesan sequence 4 -> sequence = 4.)
@@ -6566,22 +6621,24 @@
       return allMatches.length === 1 ? allMatches[0] : null;
     }
 
-    for (let index = currentIndex - 1; index >= 0; index -= 1) {
-      const candidate = messages[index];
-      if (senderKey && !replySenderMatches(candidate, senderKey)) continue;
-      if (replyPreviewMatchesMessage(previewKey, candidate)) return candidate;
-    }
+    const scored = messages.slice(0, currentIndex).map((candidate, index) => {
+      const contentScore = replyPreviewMatchScore(previewKey, candidate);
+      const senderBonus = senderKey && replySenderMatches(candidate, senderKey) ? 45 : 0;
+      return { candidate, index, contentScore, score: contentScore + senderBonus };
+    }).filter((entry) => entry.contentScore >= 700);
 
-    // Sender parsing WhatsApp tidak selalu tersedia. Jika pencarian dengan sender
-    // gagal, ulangi berdasarkan preview saja, tetap dari pesan terdekat ke belakang.
-    if (senderKey) {
-      for (let index = currentIndex - 1; index >= 0; index -= 1) {
-        const candidate = messages[index];
-        if (replyPreviewMatchesMessage(previewKey, candidate)) return candidate;
-      }
-    }
+    scored.sort((left, right) =>
+      right.score - left.score || right.index - left.index
+    );
+    if (scored.length === 0) return null;
 
-    return null;
+    const best = scored[0];
+    const second = scored[1];
+    // Jangan menebak jika dua pesan mempunyai kecocokan hampir sama. Sender
+    // boleh memecahkan tie, tetapi kedekatan sequence tidak boleh mengalahkan
+    // perbedaan konten karena target reply dapat berada jauh di atas.
+    if (second && best.score - second.score < 30) return null;
+    return best.candidate;
   }
 
   function isGenericMediaReplyPreview(previewKey) {
@@ -6605,23 +6662,87 @@
   }
 
   function normalizeReplyComparable(value) {
-    return normalizeComparable(value)
+    return cleanText(value)
+      .toLocaleLowerCase()
+      // Preview quote WhatsApp tidak selalu mempertahankan marker format body.
+      .replace(/```/g, " ")
+      .replace(/[*_~`]/g, "")
+      .replace(/(^|\n)\s*>\s?/g, "$1")
+      // Abaikan tanda baca dan ellipsis; huruf/angka serta urutannya tetap wajib
+      // sama sehingga ini bukan fuzzy matching bebas.
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
       .replace(/\s+/g, " ")
-      .replace(/[.…]+$/g, "")
       .trim();
   }
 
-  function replyPreviewMatchesMessage(previewKey, candidate) {
-    if (!previewKey) return false;
+  function replyOrderedTokenCoverage(previewKey, textKey) {
+    const previewTokens = previewKey.split(" ").filter(Boolean).slice(0, 100);
+    const textTokens = textKey.split(" ").filter(Boolean).slice(0, 400);
+    if (previewTokens.length < 4 || textTokens.length === 0) return null;
 
-    const textKey = normalizeReplyComparable(candidate.text || "");
-    if (textKey) {
-      if (textKey === previewKey) return true;
-      if (textKey.startsWith(previewKey) || previewKey.startsWith(textKey)) return true;
-      if (previewKey.length >= 18 && textKey.includes(previewKey)) return true;
+    let cursor = 0;
+    let matched = 0;
+    let firstPosition = -1;
+    let longestRun = 0;
+    let currentRun = 0;
+    let previousPosition = -2;
+
+    for (let previewIndex = 0; previewIndex < previewTokens.length; previewIndex += 1) {
+      const token = previewTokens[previewIndex];
+      let foundPosition = -1;
+      for (let textIndex = cursor; textIndex < textTokens.length; textIndex += 1) {
+        const candidateToken = textTokens[textIndex];
+        const isLastPreviewToken = previewIndex === previewTokens.length - 1;
+        const matches = candidateToken === token ||
+          (isLastPreviewToken && token.length >= 2 && candidateToken.startsWith(token));
+        if (matches) {
+          foundPosition = textIndex;
+          break;
+        }
+      }
+      if (foundPosition < 0) continue;
+
+      if (firstPosition < 0) firstPosition = foundPosition;
+      matched += 1;
+      currentRun = foundPosition === previousPosition + 1 ? currentRun + 1 : 1;
+      longestRun = Math.max(longestRun, currentRun);
+      previousPosition = foundPosition;
+      cursor = foundPosition + 1;
     }
 
-    return replyPreviewMatchesMediaType(previewKey, candidate.type);
+    return {
+      coverage: matched / previewTokens.length,
+      matched,
+      firstPosition,
+      longestRun,
+      previewTokenCount: previewTokens.length
+    };
+  }
+
+  function replyPreviewMatchScore(previewKey, candidate) {
+    if (!previewKey) return 0;
+    if (replyPreviewMatchesMediaType(previewKey, candidate.type)) return 700;
+
+    const textKey = normalizeReplyComparable(candidate.text || "");
+    if (!textKey) return 0;
+    if (textKey === previewKey) return 1000;
+    if (previewKey.length < 18) return 0;
+    if (textKey.startsWith(previewKey)) return 970;
+    if (previewKey.startsWith(textKey)) return 950;
+    if (textKey.includes(previewKey)) return 940;
+
+    const tokenMatch = replyOrderedTokenCoverage(previewKey, textKey);
+    if (!tokenMatch || tokenMatch.matched < 4 || tokenMatch.coverage < 0.72) return 0;
+    // Quote preview umumnya berasal dari awal pesan. Izinkan sedikit metadata
+    // pembuka, tetapi jangan cocokkan kumpulan kata umum jauh di tengah pesan.
+    if (tokenMatch.firstPosition > 12) return 0;
+
+    const runRatio = tokenMatch.longestRun / tokenMatch.previewTokenCount;
+    return Math.round(700 + tokenMatch.coverage * 170 + runRatio * 70);
+  }
+
+  function replyPreviewMatchesMessage(previewKey, candidate) {
+    return replyPreviewMatchScore(previewKey, candidate) >= 700;
   }
 
   function replyPreviewMatchesMediaType(previewKey, type) {
